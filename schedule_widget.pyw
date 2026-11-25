@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import uuid
@@ -15,6 +16,7 @@ import subprocess
 import datetime as dt
 import tkinter as tk
 from tkinter import font as tkfont
+from tkinter import messagebox
 
 # ------------------------------------------------------------------
 # 경로 / 데이터
@@ -51,6 +53,93 @@ DEFAULT_CATEGORIES = [
 ]
 
 WEEKDAYS_KR = ["월", "화", "수", "목", "금", "토", "일"]
+WEEKDAY_IDX = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
+
+# 새 카테고리에 자동 배정할 색상 팔레트
+IMPORT_PALETTE = [
+    "#3b82f6", "#22c55e", "#f59e0b", "#ef4444", "#8b5cf6",
+    "#ec4899", "#14b8a6", "#f97316", "#0ea5e9", "#64748b",
+]
+
+_RE_SECTION = re.compile(r"^=+\s*\[(.+?)\]\s*=+$")
+_RE_WEEKDAY = re.compile(r"^<\s*([월화수목금토일])\s*요일\s*>$")
+_RE_DATED = re.compile(r"^\[(.+?)\]$")
+_RE_MMDD = re.compile(r"(\d{1,2})\s*/\s*(\d{1,2})")
+_RE_BULLET = re.compile(r"^[•·‣◦\-\*]\s*(.*)$")
+
+
+def _make_date(mm, dd):
+    """MM/DD 를 오늘과 가까운 연도의 날짜로 변환."""
+    today = dt.date.today()
+    for y in (today.year, today.year + 1, today.year - 1):
+        try:
+            d = dt.date(y, mm, dd)
+        except ValueError:
+            return None
+        if -180 <= (d - today).days <= 185:
+            return d
+    try:
+        return dt.date(today.year, mm, dd)
+    except ValueError:
+        return None
+
+
+def parse_sticky_note(text):
+    """Sticky Notes 텍스트를 파싱.
+    반환: (weekday_entries, dated_entries)
+      weekday_entries: [(weekday_idx, text, category)]
+      dated_entries:   [(date, text, category)]
+    """
+    weekday_entries = []
+    dated_entries = []
+    section = None          # 현재 섹션명(카테고리)
+    weekday = None          # 현재 요일 index
+    cur_date = None         # 현재 날짜 그룹
+    group_label = None      # 날짜 그룹 라벨(예: 혜윰, MJSEC)
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            cur_date = None     # 빈 줄은 날짜 그룹만 종료(요일은 유지)
+            continue
+
+        m = _RE_SECTION.match(line)
+        if m:
+            section = m.group(1).strip()
+            weekday = None
+            cur_date = None
+            continue
+
+        m = _RE_WEEKDAY.match(line)
+        if m:
+            weekday = WEEKDAY_IDX[m.group(1)]
+            cur_date = None
+            continue
+
+        m = _RE_DATED.match(line)
+        if m:
+            inside = m.group(1)
+            group_label = inside.split(",")[0].strip()
+            dm = _RE_MMDD.search(inside)
+            cur_date = _make_date(int(dm.group(1)), int(dm.group(2))) if dm else None
+            weekday = None
+            continue
+
+        m = _RE_BULLET.match(line)
+        if not m:
+            continue            # 글머리표가 아닌 줄은 무시
+        txt = m.group(1).strip()
+        if not txt or txt in ("-", "–", "—"):
+            continue            # "• -" 같은 빈 자리표시 무시
+
+        cat = section or "기타"
+        if weekday is not None:
+            weekday_entries.append((weekday, txt, cat))
+        elif cur_date is not None:
+            full = f"{group_label}: {txt}" if group_label else txt
+            dated_entries.append((cur_date, full, cat))
+
+    return weekday_entries, dated_entries
 
 # ------------------------------------------------------------------
 # 테마
@@ -198,6 +287,7 @@ class ScheduleWidget:
         self.lbl_week.pack(side="left", padx=6)
         self._hbtn(nav, "›", lambda: self.shift_week(1)).pack(side="left")
         self._hbtn(nav, "오늘", self.goto_today, wide=True).pack(side="right")
+        self._hbtn(nav, "📋", self.import_clipboard).pack(side="right")
 
         # 헤더 드래그로 창 이동
         for w in (header, bar, nav, self.lbl_title):
@@ -414,6 +504,85 @@ class ScheduleWidget:
             save_data(self.data)
         except Exception:
             pass
+
+    # ---------- Sticky Notes 가져오기 ----------
+    def import_clipboard(self):
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            text = ""
+        if not text or not text.strip():
+            self._toast("클립보드가 비어 있습니다")
+            return
+        self.import_from_text(text)
+
+    def import_from_text(self, text):
+        weekday_entries, dated_entries = parse_sticky_note(text)
+
+        ws = self.week_start
+        week_dates = [ws + dt.timedelta(days=i) for i in range(7)]
+        week_set = {iso(d) for d in week_dates}
+
+        # 이번 주에 들어갈 항목 모으기
+        new_by_date = {}   # iso -> [(text, cat)]
+        cats = []
+        outside = 0
+        for widx, txt, cat in weekday_entries:
+            new_by_date.setdefault(iso(ws + dt.timedelta(days=widx)), []).append((txt, cat))
+            cats.append(cat)
+        for date, txt, cat in dated_entries:
+            if iso(date) in week_set:
+                new_by_date.setdefault(iso(date), []).append((txt, cat))
+                cats.append(cat)
+            else:
+                outside += 1
+
+        count = sum(len(v) for v in new_by_date.values())
+        if count == 0:
+            msg = "가져올 항목이 없습니다"
+            if outside:
+                msg = f"이번 주 밖 {outside}개뿐 — 주를 이동해 다시 시도"
+            self._toast(msg, ms=3500)
+            return
+
+        # 기존 이번 주 항목이 있으면 덮어쓰기 확인
+        existing = sum(len(self.data["items"].get(iso(d), [])) for d in week_dates)
+        if existing:
+            ok = messagebox.askyesno(
+                "일정 가져오기",
+                f"이번 주({ws.strftime('%m/%d')}~{week_dates[-1].strftime('%m/%d')}) "
+                f"기존 항목 {existing}개를 메모 내용 {count}개로 교체할까요?",
+                parent=self.root)
+            if not ok:
+                return
+
+        self._ensure_categories(cats)
+
+        # 이번 주 덮어쓰기
+        for d in week_dates:
+            self.data["items"].pop(iso(d), None)
+        for key, lst in new_by_date.items():
+            self.data["items"][key] = [
+                {"id": uuid.uuid4().hex, "text": t, "category": c, "done": False}
+                for t, c in lst
+            ]
+
+        self._persist()
+        self.render()
+        msg = f"{count}개 항목 가져옴"
+        if outside:
+            msg += f" · 이번 주 밖 {outside}개 제외"
+        self._toast(msg, ms=3500)
+
+    def _ensure_categories(self, names):
+        existing = {c["name"] for c in self.data["categories"]}
+        idx = len(self.data["categories"])
+        for n in names:
+            if n and n not in existing:
+                self.data["categories"].append(
+                    {"name": n, "color": IMPORT_PALETTE[idx % len(IMPORT_PALETTE)]})
+                existing.add(n)
+                idx += 1
 
     # ---------- 자동 업데이트 ----------
     def check_update(self, manual=False):
