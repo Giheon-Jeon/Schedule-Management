@@ -2,8 +2,8 @@
 """
 주간 일정 위젯 (Weekly Schedule Widget)
 - 바탕화면 우측 하단에 작게 상주하는 주간(월~일) 일정 보기/편집 위젯
-- 데이터는 로컬 JSON 파일에 자동 저장
-- Sticky Notes 메모 텍스트 붙여넣기 가져오기 + 깃허브 자동 업데이트 지원
+- 컴팩트 라이트 테마 · 빈 요일은 한 줄로 접힘
+- Sticky Notes 메모 붙여넣기 가져오기(미리보기) + 깃허브 자동 업데이트
 """
 
 import os
@@ -16,10 +16,7 @@ import subprocess
 import datetime as dt
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import messagebox
 
-# ------------------------------------------------------------------
-# 경로 / 데이터
 # ------------------------------------------------------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
@@ -49,37 +46,35 @@ IMPORT_PALETTE = [
 ]
 
 FONT = "Malgun Gothic"
-W_WIDTH = 360
+W_WIDTH = 340
 W_HEIGHT = 560
 
-# ------------------------------------------------------------------
-# 테마 (라이트, 이모지 없이 안전한 글리프만 사용)
-# ------------------------------------------------------------------
 C = {
-    "frame":     "#cdd5e3",   # 바깥 테두리
-    "bg":        "#ffffff",
-    "header":    "#ffffff",
-    "sep":       "#eef1f6",
-    "title":     "#0f172a",
-    "sub":       "#64748b",
-    "muted":     "#9aa6b6",
-    "text":      "#1f2937",
-    "accent":    "#6366f1",
+    "frame":    "#cdd5e3",
+    "bg":       "#ffffff",
+    "sep":      "#eef1f6",
+    "title":    "#0f172a",
+    "sub":      "#64748b",
+    "muted":    "#aab4c2",
+    "text":     "#1f2937",
+    "accent":   "#6366f1",
     "accent_dk": "#4f46e5",
-    "accent_bg": "#eef2ff",
-    "today_bg":  "#f6f7ff",
-    "chip_bg":   "#f1f5f9",
-    "chip_fg":   "#64748b",
-    "done":      "#c3cbd8",
-    "btn":       "#64748b",
-    "btn_hi":    "#0f172a",
-    "pill_bd":   "#e2e8f0",
-    "sat_bg":    "#e4edff", "sat_fg": "#2563eb",
-    "sun_bg":    "#ffe4e6", "sun_fg": "#dc2626",
+    "today_bg": "#f6f7ff",
+    "chip_bg":  "#eef1f6",
+    "chip_fg":  "#64748b",
+    "done":     "#c3cbd8",
+    "btn":      "#64748b",
+    "btn_hi":   "#0f172a",
+    "field_bd": "#dbe1ea",
+    "sat_bg":   "#e4edff", "sat_fg": "#2563eb",
+    "sun_bg":   "#ffe4e6", "sun_fg": "#dc2626",
     "danger_bg": "#fee2e2", "danger_fg": "#dc2626",
 }
 
 
+# ------------------------------------------------------------------
+# 데이터
+# ------------------------------------------------------------------
 def load_data():
     if os.path.exists(DATA_FILE):
         try:
@@ -121,13 +116,14 @@ def run_git(args, timeout=30):
 
 
 # ------------------------------------------------------------------
-# Sticky Notes 텍스트 파서
+# Sticky Notes 파서 (여러 형식에 관대하게)
 # ------------------------------------------------------------------
-_RE_SECTION = re.compile(r"^=+\s*\[(.+?)\]\s*=+$")
-_RE_WEEKDAY = re.compile(r"^<\s*([월화수목금토일])\s*요일\s*>$")
-_RE_DATED = re.compile(r"^\[(.+?)\]$")
-_RE_MMDD = re.compile(r"(\d{1,2})\s*/\s*(\d{1,2})")
-_RE_BULLET = re.compile(r"^[•·‣◦\-\*]\s*(.*)$")
+_RE_SECTION = re.compile(r"^=+\s*\[?\s*(.+?)\s*\]?\s*=+$")
+_RE_WEEKDAY = re.compile(r"^<\s*([월화수목금토일])\s*(?:요일)?\s*>\s*$")
+_RE_WEEKDAY2 = re.compile(r"^([월화수목금토일])요일\s*[:：]?\s*$")
+_RE_BRACKET = re.compile(r"^\[(.+?)\]\s*[:：]?\s*$")
+_RE_MMDD = re.compile(r"(\d{1,2})\s*[/\.\-]\s*(\d{1,2})")
+_RE_BULLET = re.compile(r"^(?:[•·‣◦●○▪▸▹◆■\-\*]|\d+[.)])\s*(.*)$")
 
 
 def _make_date(mm, dd):
@@ -146,35 +142,45 @@ def _make_date(mm, dd):
 
 
 def parse_sticky_note(text):
+    """반환: (weekday_entries, dated_entries)
+       weekday_entries: [(weekday_idx, text, category)]
+       dated_entries:   [(date, text, category)]"""
     weekday_entries, dated_entries = [], []
     section = weekday = cur_date = group_label = None
-    for raw in text.splitlines():
+
+    for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
             cur_date = None
             continue
+
         m = _RE_SECTION.match(line)
-        if m:
+        if m and ("[" in line or "=" * 3 in line):
             section, weekday, cur_date = m.group(1).strip(), None, None
             continue
-        m = _RE_WEEKDAY.match(line)
+
+        m = _RE_WEEKDAY.match(line) or _RE_WEEKDAY2.match(line)
         if m:
             weekday, cur_date = WEEKDAY_IDX[m.group(1)], None
             continue
-        m = _RE_DATED.match(line)
+
+        m = _RE_BRACKET.match(line)
         if m:
-            inside = m.group(1)
-            group_label = inside.split(",")[0].strip()
+            inside = m.group(1).strip()
             dm = _RE_MMDD.search(inside)
-            cur_date = _make_date(int(dm.group(1)), int(dm.group(2))) if dm else None
-            weekday = None
+            if dm:
+                group_label = inside.split(",")[0].strip()
+                cur_date = _make_date(int(dm.group(1)), int(dm.group(2)))
+                weekday = None
+            else:
+                section, weekday, cur_date = inside, None, None
             continue
+
         m = _RE_BULLET.match(line)
-        if not m:
+        txt = m.group(1).strip() if m else line
+        if not txt or txt in ("-", "–", "—", "."):
             continue
-        txt = m.group(1).strip()
-        if not txt or txt in ("-", "–", "—"):
-            continue
+
         cat = section or "기타"
         if weekday is not None:
             weekday_entries.append((weekday, txt, cat))
@@ -182,6 +188,23 @@ def parse_sticky_note(text):
             full = f"{group_label}: {txt}" if group_label else txt
             dated_entries.append((cur_date, full, cat))
     return weekday_entries, dated_entries
+
+
+def plan_import(text, week_start):
+    """현재 주 기준으로 들어갈 항목 목록과, 주 범위 밖 개수를 돌려줌."""
+    wd, dated = parse_sticky_note(text)
+    week_dates = [week_start + dt.timedelta(days=i) for i in range(7)]
+    week_set = {iso(d) for d in week_dates}
+    inweek, outside = [], 0
+    for widx, t, c in wd:
+        inweek.append((week_start + dt.timedelta(days=widx), t, c))
+    for d, t, c in dated:
+        if iso(d) in week_set:
+            inweek.append((d, t, c))
+        else:
+            outside += 1
+    inweek.sort(key=lambda x: x[0])
+    return inweek, outside
 
 
 # ------------------------------------------------------------------
@@ -210,20 +233,18 @@ class ScheduleWidget:
         root.protocol("WM_DELETE_WINDOW", self.quit)
         root.after(1500, lambda: self.check_update(manual=False))
 
-    # ---------- 폰트 ----------
     def _init_fonts(self):
         self.f_title = tkfont.Font(family=FONT, size=12, weight="bold")
         self.f_sub = tkfont.Font(family=FONT, size=9)
         self.f_ctrl = tkfont.Font(family=FONT, size=9)
-        self.f_nav = tkfont.Font(family=FONT, size=12, weight="bold")
+        self.f_act = tkfont.Font(family=FONT, size=9)
+        self.f_nav = tkfont.Font(family=FONT, size=13, weight="bold")
         self.f_chip = tkfont.Font(family=FONT, size=9, weight="bold")
         self.f_date = tkfont.Font(family=FONT, size=9, weight="bold")
-        self.f_add = tkfont.Font(family=FONT, size=8, weight="bold")
+        self.f_add = tkfont.Font(family=FONT, size=12)
         self.f_item = tkfont.Font(family=FONT, size=10)
         self.f_item_done = tkfont.Font(family=FONT, size=10, overstrike=1)
-        self.f_empty = tkfont.Font(family=FONT, size=8)
 
-    # ---------- 창 위치 ----------
     def _place_window(self):
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
@@ -237,66 +258,62 @@ class ScheduleWidget:
         self.root.geometry(f"{W_WIDTH}x{W_HEIGHT}+{x}+{y}")
 
     # ---------- 버튼 헬퍼 ----------
-    def _btn(self, parent, text, cmd, font, fg, hover, bg):
+    def _txt(self, parent, text, cmd, font=None, fg=None, hi=None, bg=None):
+        font = font or self.f_ctrl
+        fg = fg or C["btn"]
+        hi = hi or C["btn_hi"]
+        bg = bg or C["bg"]
         b = tk.Label(parent, text=text, font=font, bg=bg, fg=fg, cursor="hand2")
         b.bind("<Button-1>", lambda e: cmd())
-        b.bind("<Enter>", lambda e: b.configure(fg=hover))
+        b.bind("<Enter>", lambda e: b.configure(fg=hi))
         b.bind("<Leave>", lambda e: b.configure(fg=fg))
         return b
 
-    def _pill(self, parent, text, cmd):
-        b = tk.Label(parent, text=text, font=self.f_add, bg=C["bg"],
-                     fg=C["sub"], cursor="hand2", padx=9, pady=3,
-                     highlightthickness=1, highlightbackground=C["pill_bd"])
+    def _solid(self, parent, text, cmd):
+        b = tk.Label(parent, text=text, font=self.f_act, bg=C["accent"],
+                     fg="#ffffff", cursor="hand2", padx=11, pady=3)
         b.bind("<Button-1>", lambda e: cmd())
-        b.bind("<Enter>", lambda e: b.configure(fg=C["accent_dk"],
-                                                highlightbackground=C["accent"]))
-        b.bind("<Leave>", lambda e: b.configure(fg=C["sub"],
-                                                highlightbackground=C["pill_bd"]))
+        b.bind("<Enter>", lambda e: b.configure(bg=C["accent_dk"]))
+        b.bind("<Leave>", lambda e: b.configure(bg=C["accent"]))
         return b
 
-    # ---------- UI 구성 ----------
+    # ---------- UI ----------
     def _build(self):
         outer = tk.Frame(self.root, bg=C["bg"])
         outer.pack(fill="both", expand=True, padx=1, pady=1)
 
-        header = tk.Frame(outer, bg=C["header"])
+        header = tk.Frame(outer, bg=C["bg"])
         header.pack(fill="x")
         self.header = header
 
-        # 1행: 제목 + 창 컨트롤
-        row1 = tk.Frame(header, bg=C["header"])
-        row1.pack(fill="x", padx=14, pady=(11, 4))
+        row1 = tk.Frame(header, bg=C["bg"])
+        row1.pack(fill="x", padx=14, pady=(11, 5))
         tk.Label(row1, text="주간 일정", font=self.f_title,
-                 bg=C["header"], fg=C["title"]).pack(side="left")
-
-        self._btn(row1, "✕", self.quit, self.f_ctrl, C["btn"], C["btn_hi"],
-                  C["header"]).pack(side="right", padx=(10, 0))
-        self._btn(row1, "—", self.toggle_collapse, self.f_ctrl, C["btn"],
-                  C["btn_hi"], C["header"]).pack(side="right", padx=(10, 0))
-        self.btn_pin = self._btn(row1, "고정", self.toggle_topmost, self.f_ctrl,
-                                 C["accent"] if self.topmost else C["btn"],
-                                 C["accent_dk"], C["header"])
+                 bg=C["bg"], fg=C["title"]).pack(side="left")
+        self._txt(row1, "✕", self.quit).pack(side="right", padx=(12, 0))
+        self._txt(row1, "—", self.toggle_collapse).pack(side="right", padx=(12, 0))
+        self.btn_pin = self._txt(row1, "고정", self.toggle_topmost,
+                                 fg=C["accent"] if self.topmost else C["btn"],
+                                 hi=C["accent_dk"])
         self.btn_pin.pack(side="right")
 
-        # 2행: 주 이동 + 액션
-        row2 = tk.Frame(header, bg=C["header"])
+        row2 = tk.Frame(header, bg=C["bg"])
         row2.pack(fill="x", padx=14, pady=(0, 11))
-        self._btn(row2, "‹", lambda: self.shift_week(-1), self.f_nav, C["sub"],
-                  C["accent"], C["header"]).pack(side="left")
+        self._txt(row2, "‹", lambda: self.shift_week(-1), font=self.f_nav,
+                  fg=C["sub"], hi=C["accent"]).pack(side="left")
         self.lbl_week = tk.Label(row2, text="", font=self.f_sub,
-                                 bg=C["header"], fg=C["sub"])
-        self.lbl_week.pack(side="left", padx=7)
-        self._btn(row2, "›", lambda: self.shift_week(1), self.f_nav, C["sub"],
-                  C["accent"], C["header"]).pack(side="left")
+                                 bg=C["bg"], fg=C["sub"])
+        self.lbl_week.pack(side="left", padx=6)
+        self._txt(row2, "›", lambda: self.shift_week(1), font=self.f_nav,
+                  fg=C["sub"], hi=C["accent"]).pack(side="left")
 
-        self._pill(row2, "오늘", self.goto_today).pack(side="right")
-        self._pill(row2, "새로고침", lambda: self.check_update(manual=True)
-                   ).pack(side="right", padx=(0, 6))
-        self._pill(row2, "가져오기", self.import_clipboard
-                   ).pack(side="right", padx=(0, 6))
+        self._solid(row2, "오늘", self.goto_today).pack(side="right")
+        self._txt(row2, "새로고침", lambda: self.check_update(manual=True),
+                  font=self.f_act, fg=C["sub"], hi=C["accent"]).pack(
+                  side="right", padx=(0, 12))
+        self._txt(row2, "가져오기", self.open_import, font=self.f_act,
+                  fg=C["accent"], hi=C["accent_dk"]).pack(side="right", padx=(0, 12))
 
-        # 드래그로 이동
         for w in (header, row1, row2):
             w.bind("<Button-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
@@ -304,7 +321,6 @@ class ScheduleWidget:
 
         tk.Frame(outer, bg=C["sep"], height=1).pack(fill="x")
 
-        # 본문 (스크롤)
         self.body_wrap = tk.Frame(outer, bg=C["bg"])
         self.body_wrap.pack(fill="both", expand=True)
         self.canvas = tk.Canvas(self.body_wrap, bg=C["bg"], highlightthickness=0, bd=0)
@@ -338,65 +354,59 @@ class ScheduleWidget:
         ws = self.week_start
         for i in range(7):
             day = ws + dt.timedelta(days=i)
-            self._render_day(day, i, is_today=(day == today), first=(i == 0))
+            self._render_day(day, i, is_today=(day == today))
+        tk.Frame(self.body, bg=C["bg"], height=8).pack()
         self.body.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.canvas.yview_moveto(0)
 
-    def _render_day(self, day, idx, is_today, first):
+    def _render_day(self, day, idx, is_today):
+        items = self.data["items"].get(iso(day), [])
         bg = C["today_bg"] if is_today else C["bg"]
+
         block = tk.Frame(self.body, bg=bg)
         block.pack(fill="x")
-
-        # 오늘 강조용 좌측 액센트 바
-        bar = tk.Frame(block, bg=C["accent"] if is_today else bg, width=3)
-        bar.pack(side="left", fill="y")
-
+        tk.Frame(block, bg=C["accent"] if is_today else bg, width=3).pack(
+            side="left", fill="y")
         inner = tk.Frame(block, bg=bg)
         inner.pack(side="left", fill="both", expand=True)
 
-        # 날짜 헤더
         head = tk.Frame(inner, bg=bg)
-        head.pack(fill="x", padx=12, pady=(10, 4))
+        head.pack(fill="x", padx=11, pady=(6, 3) if items else 5)
 
         if is_today:
-            chip_bg, chip_fg = C["accent"], "#ffffff"
+            cbg, cfg = C["accent"], "#ffffff"
         elif idx == 5:
-            chip_bg, chip_fg = C["sat_bg"], C["sat_fg"]
+            cbg, cfg = C["sat_bg"], C["sat_fg"]
         elif idx == 6:
-            chip_bg, chip_fg = C["sun_bg"], C["sun_fg"]
+            cbg, cfg = C["sun_bg"], C["sun_fg"]
         else:
-            chip_bg, chip_fg = C["chip_bg"], C["chip_fg"]
+            cbg, cfg = C["chip_bg"], C["chip_fg"]
         tk.Label(head, text=f" {WEEKDAYS_KR[idx]} ", font=self.f_chip,
-                 bg=chip_bg, fg=chip_fg, padx=4, pady=1).pack(side="left")
+                 bg=cbg, fg=cfg, padx=3, pady=1).pack(side="left")
         tk.Label(head, text=day.strftime("%m/%d"), font=self.f_date,
-                 bg=bg, fg=C["sub"]).pack(side="left", padx=(8, 0))
+                 bg=bg, fg=C["sub"] if items else C["muted"]).pack(
+                 side="left", padx=(8, 0))
+        self._txt(head, "＋", lambda d=day: self.add_item(d), font=self.f_add,
+                  fg=C["muted"], hi=C["accent"], bg=bg).pack(side="right")
 
-        add = self._btn(head, "＋ 추가", lambda d=day: self.add_item(d),
-                        self.f_add, C["muted"], C["accent"], bg)
-        add.pack(side="right")
+        for it in items:
+            self._render_item(inner, bg, day, it)
+        if items:
+            tk.Frame(inner, bg=bg, height=6).pack()
 
-        items = self.data["items"].get(iso(day), [])
-        if not items:
-            tk.Label(inner, text="일정 없음", font=self.f_empty, bg=bg,
-                     fg=C["muted"]).pack(anchor="w", padx=16, pady=(0, 9))
-        else:
-            for it in items:
-                self._render_item(inner, bg, day, it)
-            tk.Frame(inner, bg=bg, height=7).pack()
-
-        tk.Frame(self.body, bg=C["sep"], height=1).pack(fill="x", padx=12)
+        tk.Frame(self.body, bg=C["sep"], height=1).pack(fill="x", padx=11)
 
     def _render_item(self, parent, bg, day, it):
         row = tk.Frame(parent, bg=bg)
-        row.pack(fill="x", padx=14, pady=2)
+        row.pack(fill="x", padx=13, pady=1)
 
         color = self._cat_color(it.get("category"))
         done = it.get("done", False)
 
-        dot = tk.Canvas(row, width=10, height=18, bg=bg, highlightthickness=0)
-        dot.create_oval(1, 7, 9, 15, fill=color, outline=color)
-        dot.pack(side="left", padx=(0, 6))
+        dot = tk.Canvas(row, width=9, height=18, bg=bg, highlightthickness=0)
+        dot.create_oval(1, 7, 8, 14, fill=color, outline=color)
+        dot.pack(side="left", padx=(0, 5))
 
         chk = tk.Label(row, text=("☑" if done else "☐"), font=self.f_item,
                        bg=bg, fg=(C["done"] if done else C["sub"]), cursor="hand2")
@@ -407,7 +417,7 @@ class ScheduleWidget:
         fg = C["done"] if done else C["text"]
         txt = tk.Label(row, text=it.get("text", ""), font=fnt, bg=bg, fg=fg,
                        cursor="hand2", anchor="w", justify="left",
-                       wraplength=W_WIDTH - 95)
+                       wraplength=W_WIDTH - 85)
         txt.pack(side="left", fill="x", expand=True, padx=(5, 0))
         txt.bind("<Button-1>", lambda e, d=day, i=it: self.edit_item(d, i))
 
@@ -476,63 +486,29 @@ class ScheduleWidget:
         self.data["window"]["collapsed"] = self.collapsed
         self._persist()
 
-    # ---------- Sticky Notes 가져오기 ----------
-    def import_clipboard(self):
-        try:
-            text = self.root.clipboard_get()
-        except Exception:
-            text = ""
-        if not text or not text.strip():
-            self._toast("클립보드가 비어 있습니다")
-            return
-        self.import_from_text(text)
+    # ---------- 가져오기 ----------
+    def open_import(self):
+        ImportDialog(self)
 
-    def import_from_text(self, text):
-        weekday_entries, dated_entries = parse_sticky_note(text)
-        ws = self.week_start
-        week_dates = [ws + dt.timedelta(days=i) for i in range(7)]
-        week_set = {iso(d) for d in week_dates}
-
-        new_by_date, cats, outside = {}, [], 0
-        for widx, txt, cat in weekday_entries:
-            new_by_date.setdefault(iso(ws + dt.timedelta(days=widx)), []).append((txt, cat))
-            cats.append(cat)
-        for date, txt, cat in dated_entries:
-            if iso(date) in week_set:
-                new_by_date.setdefault(iso(date), []).append((txt, cat))
-                cats.append(cat)
-            else:
-                outside += 1
-
-        count = sum(len(v) for v in new_by_date.values())
-        if count == 0:
-            self._toast("이번 주 밖 항목뿐 — 주 이동 후 재시도" if outside
-                        else "가져올 항목이 없습니다", ms=3500)
-            return
-
-        existing = sum(len(self.data["items"].get(iso(d), [])) for d in week_dates)
-        if existing:
-            ok = messagebox.askyesno(
-                "일정 가져오기",
-                f"이번 주({ws.strftime('%m/%d')}~{week_dates[-1].strftime('%m/%d')}) "
-                f"기존 {existing}개를 메모 {count}개로 교체할까요?",
-                parent=self.root)
-            if not ok:
-                return
-
-        self._ensure_categories(cats)
-        for d in week_dates:
-            self.data["items"].pop(iso(d), None)
-        for key, lst in new_by_date.items():
-            self.data["items"][key] = [
-                {"id": uuid.uuid4().hex, "text": t, "category": c, "done": False}
-                for t, c in lst]
+    def apply_import(self, text):
+        inweek, outside = plan_import(text, self.week_start)
+        if not inweek:
+            self._toast(f"이번 주 밖 {outside}개뿐 — 주 이동 후 재시도" if outside
+                        else "인식된 항목이 없습니다", ms=3500)
+            return False
+        self._ensure_categories([c for _, _, c in inweek])
+        for i in range(7):
+            self.data["items"].pop(iso(self.week_start + dt.timedelta(days=i)), None)
+        for date, t, c in inweek:
+            self.data["items"].setdefault(iso(date), []).append(
+                {"id": uuid.uuid4().hex, "text": t, "category": c, "done": False})
         self._persist()
         self.render()
-        msg = f"{count}개 가져옴"
+        msg = f"{len(inweek)}개 가져옴"
         if outside:
             msg += f" · 이번 주 밖 {outside}개 제외"
         self._toast(msg, ms=3500)
+        return True
 
     def _ensure_categories(self, names):
         existing = {c["name"] for c in self.data["categories"]}
@@ -608,7 +584,7 @@ class ScheduleWidget:
             pass
         self.root.destroy()
 
-    # ---------- 드래그 ----------
+    # ---------- 드래그 / 저장 ----------
     def _drag_start(self, e):
         self._drag["x"] = e.x_root - self.root.winfo_x()
         self._drag["y"] = e.y_root - self.root.winfo_y()
@@ -637,40 +613,149 @@ class ScheduleWidget:
 
 
 # ------------------------------------------------------------------
+# 공통: 프레임리스 모달
+# ------------------------------------------------------------------
+def _modal(app, width):
+    top = tk.Toplevel(app.root)
+    top.overrideredirect(True)
+    top.configure(bg=C["frame"])
+    top.attributes("-topmost", True)
+    top.grab_set()
+    wrap = tk.Frame(top, bg=C["bg"])
+    wrap.pack(fill="both", expand=True, padx=1, pady=1)
+    return top, wrap
+
+
+def _accent_head(wrap, app, text):
+    head = tk.Frame(wrap, bg=C["accent"])
+    head.pack(fill="x")
+    tk.Label(head, text=text, font=app.f_date, bg=C["accent"],
+             fg="#ffffff").pack(side="left", padx=14, pady=8)
+    return head
+
+
+# ------------------------------------------------------------------
+# 가져오기 대화상자 (붙여넣기 + 미리보기)
+# ------------------------------------------------------------------
+class ImportDialog:
+    def __init__(self, app):
+        self.app = app
+        top, wrap = _modal(app, 360)
+        self.top = top
+
+        ws = app.week_start
+        we = ws + dt.timedelta(days=6)
+        _accent_head(wrap, app, f"가져오기 · {ws.strftime('%m/%d')}~{we.strftime('%m/%d')} 주")
+
+        inner = tk.Frame(wrap, bg=C["bg"])
+        inner.pack(fill="both", expand=True, padx=14, pady=12)
+
+        tk.Label(inner, text="Sticky Notes 내용을 복사해 아래에 붙여넣으세요 (Ctrl+V)",
+                 font=app.f_act, bg=C["bg"], fg=C["sub"]).pack(anchor="w")
+
+        self.text = tk.Text(inner, height=7, width=40, font=app.f_item, wrap="word",
+                            relief="solid", bd=1, highlightthickness=1,
+                            highlightbackground=C["field_bd"],
+                            highlightcolor=C["accent"], padx=6, pady=5)
+        self.text.pack(fill="x", pady=(5, 8))
+        self.text.bind("<KeyRelease>", lambda e: self._refresh())
+        self.text.bind("<<Paste>>", lambda e: self.top.after(20, self._refresh))
+
+        tk.Label(inner, text="인식된 항목", font=app.f_act, bg=C["bg"],
+                 fg=C["sub"]).pack(anchor="w")
+        self.preview = tk.Text(inner, height=8, width=40, font=app.f_act, wrap="word",
+                              relief="flat", bd=0, bg=C["today_bg"],
+                              state="disabled", padx=8, pady=6)
+        self.preview.pack(fill="x", pady=(4, 10))
+
+        btns = tk.Frame(inner, bg=C["bg"])
+        btns.pack(fill="x")
+        self._b(btns, "취소", self._close, C["chip_bg"], C["text"]).pack(side="right", padx=(6, 0))
+        self.apply_btn = self._b(btns, "적용", self._apply, C["accent"], "#ffffff")
+        self.apply_btn.pack(side="right")
+
+        top.update_idletasks()
+        w, h = 340, top.winfo_reqheight()
+        px = app.root.winfo_x() + (W_WIDTH - w) // 2
+        py = max(40, app.root.winfo_y() + 60)
+        top.geometry(f"{w}x{h}+{px}+{py}")
+
+        # 클립보드 자동 채우기
+        try:
+            clip = app.root.clipboard_get()
+        except Exception:
+            clip = ""
+        if clip and clip.strip():
+            self.text.insert("1.0", clip)
+        self.text.focus_set()
+        self._refresh()
+        top.bind("<Escape>", lambda e: self._close())
+
+    def _b(self, parent, text, cmd, bg, fg):
+        b = tk.Label(parent, text=text, font=self.app.f_date, bg=bg, fg=fg,
+                     padx=16, pady=6, cursor="hand2")
+        b.bind("<Button-1>", lambda e: cmd())
+        return b
+
+    def _refresh(self):
+        text = self.text.get("1.0", "end")
+        inweek, outside = plan_import(text, self.app.week_start)
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        if not inweek and not outside:
+            self.preview.insert("end", "아직 인식된 항목이 없습니다.\n"
+                                "형식 예:  <수요일> / • 할 일 / [혜윰, 11/29]")
+        else:
+            for date, t, c in inweek:
+                wd = WEEKDAYS_KR[date.weekday()]
+                line = t if len(t) <= 26 else t[:25] + "…"
+                self.preview.insert("end", f"{wd} {date.strftime('%m/%d')}  {line}\n")
+            if outside:
+                self.preview.insert("end", f"\n(이번 주 밖 {outside}개는 제외됩니다)")
+            if not inweek and outside:
+                self.preview.insert("1.0", "이번 주에 들어갈 항목이 없습니다.\n"
+                                    "주를 이동한 뒤 다시 적용하세요.\n\n")
+        self.preview.configure(state="disabled")
+        n = len(inweek)
+        self.apply_btn.configure(text=f"적용 ({n})" if n else "적용")
+
+    def _apply(self):
+        if self.app.apply_import(self.text.get("1.0", "end")):
+            self._close()
+
+    def _close(self):
+        try:
+            self.top.grab_release()
+        except Exception:
+            pass
+        self.top.destroy()
+
+
+# ------------------------------------------------------------------
 # 항목 추가/편집 대화상자
 # ------------------------------------------------------------------
 class ItemDialog:
     def __init__(self, app, day, item):
         self.app, self.day, self.item = app, day, item
-        top = tk.Toplevel(app.root)
+        top, wrap = _modal(app, 320)
         self.top = top
-        top.overrideredirect(True)
-        top.configure(bg=C["frame"])
-        top.attributes("-topmost", True)
-        top.grab_set()
 
-        wrap = tk.Frame(top, bg=C["bg"])
-        wrap.pack(fill="both", expand=True, padx=1, pady=1)
-
-        head = tk.Frame(wrap, bg=C["accent"])
-        head.pack(fill="x")
         title = "일정 편집" if item else "일정 추가"
-        tk.Label(head, text=f"{title}   {day.strftime('%m/%d')} "
-                 f"({WEEKDAYS_KR[day.weekday()]})", font=app.f_date,
-                 bg=C["accent"], fg="#ffffff").pack(side="left", padx=14, pady=8)
+        _accent_head(wrap, app, f"{title} · {day.strftime('%m/%d')} "
+                     f"({WEEKDAYS_KR[day.weekday()]})")
 
         inner = tk.Frame(wrap, bg=C["bg"])
         inner.pack(fill="both", expand=True, padx=16, pady=14)
 
-        tk.Label(inner, text="할 일", font=app.f_add, bg=C["bg"],
+        tk.Label(inner, text="할 일", font=app.f_act, bg=C["bg"],
                  fg=C["sub"]).pack(anchor="w")
         self.entry = tk.Entry(inner, font=app.f_item, relief="solid", bd=1,
-                              highlightthickness=1, highlightbackground=C["pill_bd"],
+                              highlightthickness=1, highlightbackground=C["field_bd"],
                               highlightcolor=C["accent"])
         self.entry.pack(fill="x", pady=(4, 12), ipady=5)
         self.entry.insert(0, item.get("text", "") if item else "")
 
-        tk.Label(inner, text="카테고리", font=app.f_add, bg=C["bg"],
+        tk.Label(inner, text="카테고리", font=app.f_act, bg=C["bg"],
                  fg=C["sub"]).pack(anchor="w")
         cat_frame = tk.Frame(inner, bg=C["bg"])
         cat_frame.pack(fill="x", pady=(6, 14))
@@ -683,7 +768,7 @@ class ItemDialog:
             if i and i % 4 == 0:
                 row = tk.Frame(cat_frame, bg=C["bg"])
                 row.pack(fill="x", pady=(5, 0))
-            b = tk.Label(row, text=c["name"], font=app.f_add, bg=C["chip_bg"],
+            b = tk.Label(row, text=c["name"], font=app.f_act, bg=C["chip_bg"],
                          fg=C["text"], padx=9, pady=4, cursor="hand2",
                          highlightthickness=2, highlightbackground=C["chip_bg"])
             b.pack(side="left", padx=(0, 5))
@@ -694,11 +779,10 @@ class ItemDialog:
         btns = tk.Frame(inner, bg=C["bg"])
         btns.pack(fill="x")
         if item:
-            self._dbtn(btns, "삭제", self._delete, C["danger_bg"],
-                       C["danger_fg"]).pack(side="left")
-        self._dbtn(btns, "취소", self._cancel, C["chip_bg"],
-                   C["text"]).pack(side="right", padx=(6, 0))
-        self._dbtn(btns, "저장", self._save, C["accent"], "#ffffff").pack(side="right")
+            self._b(btns, "삭제", self._delete, C["danger_bg"],
+                    C["danger_fg"]).pack(side="left")
+        self._b(btns, "취소", self._cancel, C["chip_bg"], C["text"]).pack(side="right", padx=(6, 0))
+        self._b(btns, "저장", self._save, C["accent"], "#ffffff").pack(side="right")
 
         top.update_idletasks()
         w, h = 320, top.winfo_reqheight()
@@ -709,7 +793,7 @@ class ItemDialog:
         top.bind("<Return>", lambda e: self._save())
         top.bind("<Escape>", lambda e: self._cancel())
 
-    def _dbtn(self, parent, text, cmd, bg, fg):
+    def _b(self, parent, text, cmd, bg, fg):
         b = tk.Label(parent, text=text, font=self.app.f_date, bg=bg, fg=fg,
                      padx=16, pady=6, cursor="hand2")
         b.bind("<Button-1>", lambda e: cmd())
