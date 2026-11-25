@@ -10,6 +10,8 @@ import os
 import sys
 import json
 import uuid
+import threading
+import subprocess
 import datetime as dt
 import tkinter as tk
 from tkinter import font as tkfont
@@ -18,6 +20,25 @@ from tkinter import font as tkfont
 # 경로 / 데이터
 # ------------------------------------------------------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# subprocess 플래그 (pythonw 실행 시 콘솔 창이 깜빡이지 않도록)
+if os.name == "nt":
+    CREATE_NO_WINDOW = 0x08000000
+    DETACHED_PROCESS = 0x00000008
+else:
+    CREATE_NO_WINDOW = 0
+    DETACHED_PROCESS = 0
+
+
+def run_git(args, timeout=30):
+    """git 명령 실행. 실패/미설치 시 None 반환."""
+    try:
+        return subprocess.run(
+            ["git"] + args, cwd=APP_DIR, capture_output=True, text=True,
+            timeout=timeout, creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
 DATA_DIR = os.path.join(APP_DIR, "data")
 DATA_FILE = os.path.join(DATA_DIR, "schedule.json")
 
@@ -114,6 +135,9 @@ class ScheduleWidget:
         root.bind("<MouseWheel>", self._on_wheel)
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
+        # 시작 후 조용히 깃허브 업데이트 확인 (창이 먼저 뜨도록 지연)
+        root.after(1500, lambda: self.check_update(manual=False))
+
     # ---------- 폰트 ----------
     def _init_fonts(self):
         fam = "Malgun Gothic"
@@ -163,6 +187,7 @@ class ScheduleWidget:
         self.btn_pin = self._hbtn(bar, "📌", self.toggle_topmost)
         self.btn_pin.pack(side="right")
         self._hbtn(bar, "–", self.toggle_collapse).pack(side="right")
+        self._hbtn(bar, "↻", lambda: self.check_update(manual=True)).pack(side="right")
 
         # 주 이동 바
         nav = tk.Frame(header, bg=C["header_bg"])
@@ -214,11 +239,14 @@ class ScheduleWidget:
         return b
 
     # ---------- 렌더링 ----------
-    def render(self):
+    def _week_range_text(self):
         ws = self.week_start
         we = ws + dt.timedelta(days=6)
-        self.lbl_week.configure(
-            text=f"{ws.strftime('%Y.%m.%d')} ~ {we.strftime('%m.%d')}")
+        return f"{ws.strftime('%Y.%m.%d')} ~ {we.strftime('%m.%d')}"
+
+    def render(self):
+        ws = self.week_start
+        self.lbl_week.configure(text=self._week_range_text())
 
         for ch in self.body.winfo_children():
             ch.destroy()
@@ -386,6 +414,78 @@ class ScheduleWidget:
             save_data(self.data)
         except Exception:
             pass
+
+    # ---------- 자동 업데이트 ----------
+    def check_update(self, manual=False):
+        """깃허브 원격에 새 커밋이 있으면 pull 후 재시작. 백그라운드 스레드에서 실행."""
+        if getattr(self, "_updating", False):
+            return
+        self._updating = True
+        if manual:
+            self._toast("업데이트 확인 중…")
+        threading.Thread(target=self._update_worker, args=(manual,),
+                         daemon=True).start()
+
+    def _update_worker(self, manual):
+        result = self._do_update()
+        self.root.after(0, lambda: self._after_update(result, manual))
+
+    def _do_update(self):
+        # git 설치/저장소 여부 확인
+        top = run_git(["rev-parse", "--is-inside-work-tree"])
+        if top is None or top.returncode != 0:
+            return "no_git"
+        # 원격(upstream) 설정 확인
+        up = run_git(["rev-parse", "--abbrev-ref", "@{u}"])
+        if up is None or up.returncode != 0:
+            return "no_remote"
+        if run_git(["fetch", "--quiet"]) is None:
+            return "error"
+        local = run_git(["rev-parse", "HEAD"])
+        remote = run_git(["rev-parse", "@{u}"])
+        if (local is None or remote is None
+                or local.returncode != 0 or remote.returncode != 0):
+            return "error"
+        if local.stdout.strip() == remote.stdout.strip():
+            return "latest"
+        pull = run_git(["pull", "--ff-only", "--quiet"])
+        if pull is not None and pull.returncode == 0:
+            return "updated"
+        return "conflict"
+
+    def _after_update(self, result, manual):
+        self._updating = False
+        if result == "updated":
+            self._toast("업데이트 완료 · 재시작 중…")
+            self.root.after(900, self._restart)
+            return
+        if not manual:
+            return  # 자동 확인은 조용히 (업데이트 없을 땐 아무 표시 안 함)
+        msgs = {
+            "latest":    "최신 상태입니다",
+            "no_git":    "git 미설치 / 저장소 아님",
+            "no_remote": "원격 저장소 미설정",
+            "conflict":  "충돌로 업데이트 실패 (수동 확인 필요)",
+            "error":     "업데이트 확인 실패 (네트워크?)",
+        }
+        self._toast(msgs.get(result, "업데이트 확인 실패"))
+
+    def _toast(self, msg, ms=2600):
+        self.lbl_week.configure(text=msg)
+        if getattr(self, "_toast_job", None):
+            self.root.after_cancel(self._toast_job)
+        self._toast_job = self.root.after(
+            ms, lambda: self.lbl_week.configure(text=self._week_range_text()))
+
+    def _restart(self):
+        self._persist()
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__)], cwd=APP_DIR,
+                creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW)
+        except Exception:
+            pass
+        self.root.destroy()
 
     def quit(self):
         self._persist()
