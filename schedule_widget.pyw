@@ -15,8 +15,11 @@ import json
 import time
 import uuid
 import zlib
+import shutil
 import ctypes
+import ctypes.wintypes
 import hashlib
+import traceback
 import threading
 import subprocess
 import datetime as dt
@@ -24,10 +27,25 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 # ------------------------------------------------------------------
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.abspath(__file__)
+def _arg_value(name):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+# --app-dir: 비상용 이전 버전이 원래 폴더의 데이터를 쓰도록 할 때 사용
+APP_DIR = os.path.abspath(_arg_value("--app-dir") or os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(APP_DIR, "schedule_widget.pyw")      # 재시작 시 실행할 원래 스크립트
+FALLBACK_MODE = "--fallback" in sys.argv
 DATA_DIR = os.path.join(APP_DIR, "data")
 DATA_FILE = os.path.join(DATA_DIR, "schedule.json")
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+FALLBACK_DIR = os.path.join(DATA_DIR, "fallback")
+LOG_FILE = os.path.join(DATA_DIR, "error.log")
+BACKUP_KEEP = 14
+MUTEX_NAME = "Local\\WeeklyScheduleWidget-%08x" % zlib.crc32(APP_DIR.lower().encode("utf-8"))
 
 if os.name == "nt":
     CREATE_NO_WINDOW = 0x08000000
@@ -63,6 +81,10 @@ W_WIDTH = 340      # 논리 픽셀 (DPI 배율이 곱해짐)
 W_HEIGHT = 600
 BULLET_OUT = "⦁    "   # 메모로 보낼 때 쓰는 글머리표
 
+HOTKEY_LABEL = "Ctrl+Alt+W"
+HOTKEY_MODS = 0x0001 | 0x0002 | 0x4000      # MOD_ALT | MOD_CONTROL | MOD_NOREPEAT
+HOTKEY_VK = ord("W")
+
 C = {
     "frame":    "#cdd5e3",
     "bg":       "#ffffff",
@@ -86,6 +108,8 @@ C = {
     "danger_bg": "#fee2e2", "danger_fg": "#dc2626",
     "warn_bg":  "#ffedd5", "warn_fg": "#c2410c",
     "imp_bg":   "#fff7e6", "imp_fg": "#b45309",
+    "carry_bg": "#fffbeb", "carry_fg": "#92400e",
+    "good":     "#22c55e",
 }
 
 # ------------------------------------------------------------------
@@ -141,7 +165,7 @@ def acquire_single_instance(wait_sec=0):
     k.CloseHandle.argtypes = [ctypes.c_void_p]
     deadline = time.time() + wait_sec
     while True:
-        h = k.CreateMutexW(None, False, "Local\\WeeklyScheduleWidget")
+        h = k.CreateMutexW(None, False, MUTEX_NAME)
         err = ctypes.get_last_error()
         if h and err != 183:          # 183 = ERROR_ALREADY_EXISTS
             _MUTEX = (k, h)
@@ -164,15 +188,27 @@ def release_single_instance():
 # ------------------------------------------------------------------
 # 데이터 / 유틸
 # ------------------------------------------------------------------
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-        except Exception:
-            d = {}
-    else:
-        d = {}
+def log_error(context, exc=None):
+    """콘솔이 없어서(pythonw) 보이지 않는 오류를 data/error.log 에 기록"""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 256 * 1024:
+            os.replace(LOG_FILE, LOG_FILE + ".old")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {context}\n")
+            if exc is not None:
+                f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def install_error_hooks():
+    sys.excepthook = lambda t, v, tb: log_error("처리되지 않은 오류", v)
+    threading.excepthook = lambda a: log_error("백그라운드 작업 오류", a.exc_value)
+
+
+def _with_defaults(d):
     d.setdefault("categories", [dict(c) for c in DEFAULT_CATEGORIES])
     d.setdefault("items", {})          # 주간: {"YYYY-MM-DD": [item]}
     d.setdefault("lists", [])          # 전체: [{id,name,color,folded,items:[item]}]
@@ -182,8 +218,74 @@ def load_data():
     return d
 
 
+def _read_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError("일정 데이터 형식이 아님")
+    return d
+
+
+def _backups():
+    try:
+        return sorted(os.path.join(BACKUP_DIR, n) for n in os.listdir(BACKUP_DIR)
+                      if n.startswith("schedule-") and n.endswith(".json"))
+    except FileNotFoundError:
+        return []
+
+
+def backup_daily():
+    """하루 한 번, 그날 처음 저장하기 전 데이터를 data/backups 에 보관 (최근 BACKUP_KEEP개)"""
+    if not os.path.exists(DATA_FILE):
+        return
+    target = os.path.join(BACKUP_DIR, f"schedule-{dt.date.today():%Y-%m-%d}.json")
+    if os.path.exists(target):
+        return
+    try:
+        _read_json(DATA_FILE)            # 깨진 파일은 백업하지 않음
+    except Exception:
+        return
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    shutil.copy2(DATA_FILE, target)
+    for old in _backups()[:-BACKUP_KEEP]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def load_data():
+    """반환: (data, 알림 문구 또는 None).
+    파일이 깨졌으면 schedule.corrupt-*.json 으로 복사해 두고 가장 최근 백업에서 복구."""
+    if not os.path.exists(DATA_FILE):
+        return _with_defaults({}), None
+    try:
+        return _with_defaults(_read_json(DATA_FILE)), None
+    except Exception as e:
+        log_error("일정 파일을 읽지 못함", e)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    try:
+        shutil.copy2(DATA_FILE, os.path.join(DATA_DIR, f"schedule.corrupt-{stamp}.json"))
+    except OSError as e:
+        log_error("손상된 파일 보관 실패", e)
+    for b in reversed(_backups()):
+        try:
+            d = _read_json(b)
+        except Exception:
+            continue
+        day = os.path.basename(b)[len("schedule-"):-len(".json")]
+        return (_with_defaults(d),
+                f"일정 파일이 손상되어 {day} 백업으로 복구했습니다. (손상된 파일은 data 폴더에 보관)")
+    return (_with_defaults({}),
+            "일정 파일이 손상되었고 백업이 없습니다. 손상된 파일은 data 폴더에 보관했습니다.")
+
+
 def save_data(d):
     os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        backup_daily()
+    except Exception as e:
+        log_error("백업 실패", e)
     tmp = DATA_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
@@ -267,6 +369,86 @@ def pythonw_exe():
     exe = sys.executable
     cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
     return cand if os.path.exists(cand) else exe
+
+
+def tests_pass():
+    """tests/ 폴더가 있으면 새 코드로 테스트를 돌려 통과해야만 재시작 (실패 내용은 error.log)"""
+    tdir = os.path.join(APP_DIR, "tests")
+    if not os.path.isdir(tdir):
+        return True
+    py = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    if not os.path.exists(py):
+        py = sys.executable
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    try:
+        r = subprocess.run([py, "-m", "unittest", "discover", "-s", tdir, "-q"],
+                           cwd=APP_DIR, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120, env=env,
+                           creationflags=CREATE_NO_WINDOW)
+    except Exception as e:
+        log_error("테스트를 실행하지 못함 (업데이트는 계속)", e)
+        return True
+    if r.returncode != 0:
+        log_error("새 버전이 테스트를 통과하지 못해 재시작하지 않음\n" + (r.stderr or "")[-4000:])
+        return False
+    return True
+
+
+def save_fallback():
+    """정상 실행이 확인된 코드를 data/fallback 에 보관 (새 버전이 시작하다 죽으면 대신 실행)"""
+    if FALLBACK_MODE:
+        return
+    with open(SCRIPT, "rb") as f:
+        cur = f.read()
+    dst = os.path.join(FALLBACK_DIR, "schedule_widget.pyw")
+    if os.path.exists(dst):
+        with open(dst, "rb") as f:
+            if f.read() == cur:
+                return
+    os.makedirs(FALLBACK_DIR, exist_ok=True)
+    tmp = dst + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(cur)
+    os.replace(tmp, dst)
+
+
+def launch_fallback():
+    """보관해 둔 이전 버전을 원래 폴더의 데이터로 실행. 실행했으면 True."""
+    fb = os.path.join(FALLBACK_DIR, "schedule_widget.pyw")
+    if FALLBACK_MODE or not os.path.exists(fb):
+        return False
+    try:
+        with open(fb, "rb") as f, open(SCRIPT, "rb") as g:
+            if f.read() == g.read():
+                return False            # 지금 코드와 같으면 다시 실행해도 소용없음
+        subprocess.Popen([pythonw_exe(), fb, "--app-dir", APP_DIR, "--fallback", "--restarted"],
+                         cwd=APP_DIR, creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+        return True
+    except Exception as e:
+        log_error("비상용 이전 버전 실행 실패", e)
+        return False
+
+
+# Win32 API (창 순서 / 전역 단축키) — 전역 user32 설정을 건드리지 않도록 별도 인스턴스
+if os.name == "nt":
+    _u32 = ctypes.WinDLL("user32", use_last_error=True)
+    _u32.GetAncestor.restype = ctypes.c_void_p
+    _u32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    _u32.GetForegroundWindow.restype = ctypes.c_void_p
+    _u32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    _u32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    _u32.IsIconic.argtypes = [ctypes.c_void_p]
+    _u32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _u32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    _u32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    _u32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+    _u32.GetMessageW.argtypes = [ctypes.POINTER(ctypes.wintypes.MSG), ctypes.c_void_p,
+                                 ctypes.c_uint, ctypes.c_uint]
+else:
+    _u32 = None
 
 
 # ------------------------------------------------------------------
@@ -502,6 +684,117 @@ def export_note(data, week_start):
 
 
 # ------------------------------------------------------------------
+# 데이터 조작 (화면과 분리 — tests/ 에서 직접 검증)
+# ------------------------------------------------------------------
+def ensure_categories(data, names, color=None):
+    existing = {c["name"] for c in data["categories"]}
+    idx = len(data["categories"])
+    for n in names:
+        if n and n not in existing:
+            data["categories"].append(
+                {"name": n, "color": color or IMPORT_PALETTE[idx % len(IMPORT_PALETTE)]})
+            existing.add(n)
+            idx += 1
+
+
+def merge_import(data, plan, week_start):
+    """가져오기 계획을 데이터에 반영. 반환: (주간 항목 수, 목록 수)"""
+    inweek, other, lists = plan["inweek"], plan["other"], plan["lists"]
+
+    def make(e, was_done):
+        return {"id": new_id(), "text": e["text"], "category": e["category"],
+                "important": e["important"], "done": e["done"] or was_done,
+                "label": e["label"], "due": e["due"], "deadline": e["deadline"]}
+
+    ensure_categories(data, [e["category"] for e in inweek + other])
+
+    # 주간: 선택한 주는 메모 내용으로 교체 (같은 날짜·내용이면 완료 체크 유지)
+    if inweek:
+        keys = [iso(week_start + dt.timedelta(days=i)) for i in range(7)]
+        was_done = {(k, x.get("text"), x.get("label")) for k in keys
+                    for x in data["items"].get(k, []) if x.get("done")}
+        for k in keys:
+            data["items"].pop(k, None)
+        for e in inweek:
+            k = iso(e["date"])
+            data["items"].setdefault(k, []).append(make(e, (k, e["text"], e["label"]) in was_done))
+
+    # 다른 주의 날짜 항목(마감 등): 그 날짜에 추가 (이미 있으면 갱신)
+    for e in other:
+        k = iso(e["date"])
+        lst = data["items"].setdefault(k, [])
+        ex = next((x for x in lst if x.get("text") == e["text"]
+                   and x.get("label") == e["label"]), None)
+        if ex:
+            ex.update(category=e["category"], important=e["important"],
+                      label=e["label"], due=True, deadline=e["deadline"])
+            if e["done"]:
+                ex["done"] = True
+        else:
+            lst.append(make(e, False))
+
+    # 전체: 메모의 목록으로 교체 (같은 목록·내용이면 완료 체크, 색, 접힘 유지)
+    if lists:
+        prev = {L["name"]: L for L in data["lists"]}
+        was_done = {(L["name"], it.get("text")) for L in data["lists"]
+                    for it in L["items"] if it.get("done")}
+        new_lists = []
+        for i, L in enumerate(lists):
+            p = prev.get(L["name"], {})
+            new_lists.append({
+                "id": p.get("id", new_id()), "name": L["name"],
+                "color": p.get("color", LIST_PALETTE[i % len(LIST_PALETTE)]),
+                "folded": p.get("folded", False),
+                "items": [{"id": new_id(), "text": e["text"], "important": e["important"],
+                           "done": e["done"] or (L["name"], e["text"]) in was_done,
+                           "due_date": e["due_date"]}
+                          for e in L["items"]],
+            })
+        data["lists"] = new_lists
+
+    if plan["sections"]:
+        data["section_order"] = plan["sections"]
+        data["day_sections"] = plan["day_sections"]
+    return len(inweek) + len(other), len(lists)
+
+
+def move_item(data, from_key, item, to_date):
+    lst = data["items"].get(from_key, [])
+    data["items"][from_key] = [x for x in lst if x is not item]
+    if not data["items"][from_key]:
+        data["items"].pop(from_key, None)
+    data["items"].setdefault(iso(to_date), []).append(item)
+
+
+def carry_over_candidates(data, today, days=30):
+    """오늘 이전(최근 days일) 날짜의 미완료 항목 — D-day 항목은 날짜가 의미 있으므로 제외"""
+    out = []
+    for k, lst in data["items"].items():
+        d = from_iso(k)
+        if d and d < today and (today - d).days <= days:
+            out += [(k, it) for it in lst if not it.get("done") and not it.get("due")]
+    return sorted(out, key=lambda x: x[0])
+
+
+def carry_over(data, today):
+    cands = carry_over_candidates(data, today)
+    for k, it in cands:
+        move_item(data, k, it, today)
+    return len(cands)
+
+
+def week_progress(data, week_start):
+    items = [it for i in range(7)
+             for it in data["items"].get(iso(week_start + dt.timedelta(days=i)), [])]
+    return sum(1 for it in items if it.get("done")), len(items)
+
+
+def list_progress(data):
+    items = [it for L in data["lists"] for it in L["items"]]
+    return sum(1 for it in items if it.get("done")), len(items)
+
+
+# ------------------------------------------------------------------
 # 메인 앱
 # ------------------------------------------------------------------
 class ScheduleWidget:
@@ -511,7 +804,11 @@ class ScheduleWidget:
         SCALE = root.winfo_fpixels("1i") / 96.0
         self.W, self.H = S(W_WIDTH), S(W_HEIGHT)
 
-        self.data = load_data()
+        self.data, notice = load_data()
+        try:
+            backup_daily()
+        except Exception as e:
+            log_error("백업 실패", e)
         self.week_start = monday_of(dt.date.today())
         self.tab = self.data["window"].get("tab", "week")
         self._drag = {"x": 0, "y": 0}
@@ -519,6 +816,14 @@ class ScheduleWidget:
         self._toast_job = None
         self._sb_shown = False
         self._sig = code_signature()
+        self._today_block = None
+        self._banner = None
+        self._hwnd_cache = None
+        self._desk_mode = False
+        self._summoned = False
+        self._summon_prev_fg = None
+        self._summon_own = False
+        self._watch_logged = False
 
         root.overrideredirect(True)
         root.configure(bg=C["frame"])
@@ -532,8 +837,18 @@ class ScheduleWidget:
 
         root.bind("<MouseWheel>", self._on_wheel)
         root.protocol("WM_DELETE_WINDOW", self.quit)
+        root.report_callback_exception = self._on_tk_error
+        root.after(150, self._scroll_to_today)
         root.after(2000, lambda: self.check_update(manual=False))
+        root.after(5000, self._mark_good)
+        root.after(1000, self._watch_desktop)
         self._schedule_midnight()
+        self._start_hotkey()
+        if FALLBACK_MODE:
+            self._show_banner("새 버전이 시작 중 오류가 나서 이전 버전으로 실행 중입니다. "
+                              "내용은 data/error.log — 고친 뒤 '새로고침'을 누르세요.")
+        elif notice:
+            self._show_banner(notice)
 
     def _init_fonts(self):
         F = lambda size, **kw: tkfont.Font(family=FONT, size=size, **kw)
@@ -660,6 +975,9 @@ class ScheduleWidget:
         self.lbl_week.pack(side="left", padx=S(6))
         self._txt(self.nav_week, "›", lambda: self.shift_week(1), font=self.f_nav,
                   fg=C["sub"], hi=C["accent"]).pack(side="left")
+        self.lbl_prog = tk.Label(self.nav_week, text="", font=self.f_status, bg=C["bg"],
+                                 fg=C["muted"])
+        self.lbl_prog.pack(side="left", padx=(S(8), 0))
         self._solid(self.nav_week, "오늘", self.goto_today).pack(side="right")
 
         self.nav_all = tk.Frame(row2, bg=C["bg"])
@@ -668,12 +986,15 @@ class ScheduleWidget:
         self._solid(self.nav_all, "＋ 새 목록", self.new_list).pack(side="right")
 
         for w in (header, row1, row2, self.nav_week, self.nav_all,
-                  self.lbl_week, self.lbl_summary):
+                  self.lbl_week, self.lbl_summary, self.lbl_prog):
             w.bind("<Button-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
             w.bind("<ButtonRelease-1>", self._drag_end)
 
-        tk.Frame(outer, bg=C["sep"], height=max(1, S(1))).pack(fill="x")
+        # 진행률 막대 (헤더 아래 구분선 겸용, 접어도 보임)
+        self.prog_track = tk.Frame(outer, bg=C["sep"], height=S(3))
+        self.prog_track.pack(fill="x")
+        self.prog_fill = tk.Frame(self.prog_track, bg=C["accent"])
 
         # 본문 + 푸터 (접기 시 함께 숨김)
         self.main = tk.Frame(outer, bg=C["bg"])
@@ -697,7 +1018,7 @@ class ScheduleWidget:
                                    fg=C["muted"], anchor="center")
         self.lbl_status.pack(side="left", fill="x", expand=True, padx=S(6))
 
-        body_wrap = tk.Frame(self.main, bg=C["bg"])
+        self.body_wrap = body_wrap = tk.Frame(self.main, bg=C["bg"])
         body_wrap.pack(fill="both", expand=True)
         self.canvas = tk.Canvas(body_wrap, bg=C["bg"], highlightthickness=0, bd=0)
         self.scroll = ThinScroll(body_wrap, self.canvas)
@@ -747,31 +1068,40 @@ class ScheduleWidget:
         if save:
             self.data["window"]["tab"] = key
             self._persist()
-        self.render()
+        self.render(focus_today=(key == "week"))
 
     # ---------- 렌더링 ----------
     def _week_range_text(self):
         ws = self.week_start
         we = ws + dt.timedelta(days=6)
-        return f"{ws.strftime('%Y.%m.%d')}  –  {we.strftime('%m.%d')}"
+        fmt = "%m.%d" if ws.year == dt.date.today().year else "%Y.%m.%d"
+        return f"{ws.strftime(fmt)}  –  {we.strftime('%m.%d')}"
 
-    def render(self, keep_scroll=False):
+    def render(self, keep_scroll=False, focus_today=False):
         pos = self.canvas.yview()[0] if keep_scroll else 0.0
         for ch in self.body.winfo_children():
             ch.destroy()
+        self._today_block = None
         if self.tab == "week":
             self.lbl_week.configure(text=self._week_range_text())
+            done, total = week_progress(self.data, self.week_start)
+            self.lbl_prog.configure(text=f"·  {done}/{total} 완료" if total else "")
+            self._set_progress(done, total)
+            self._render_carry()
             self._render_upcoming()
             today = dt.date.today()
             for i in range(7):
                 day = self.week_start + dt.timedelta(days=i)
                 self._render_day(day, i, is_today=(day == today))
         else:
+            self._set_progress(*list_progress(self.data))
             self._render_lists()
         tk.Frame(self.body, bg=C["bg"], height=S(6)).pack()
         self.body.update_idletasks()
         self._update_scroll()
         self.canvas.yview_moveto(pos)
+        if focus_today:
+            self.root.after(30, self._scroll_to_today)
 
     def _upcoming(self):
         """완료 안 된 D-day 항목: [(date, item, list or None)] — 지난 14일 ~ 앞으로 30일"""
@@ -855,6 +1185,8 @@ class ScheduleWidget:
 
         block = tk.Frame(self.body, bg=bg)
         block.pack(fill="x")
+        if is_today:
+            self._today_block = block
         tk.Frame(block, bg=C["accent"] if is_today else bg, width=S(3)).pack(
             side="left", fill="y")
         inner = tk.Frame(block, bg=bg)
@@ -885,7 +1217,8 @@ class ScheduleWidget:
         for it in items:
             self._render_item(inner, bg, self._cat_color(it.get("category")), it,
                               on_edit=lambda d=day, i=it: ItemDialog(self, d, i),
-                              due_date=day if it.get("due") else None)
+                              due_date=day if it.get("due") else None,
+                              on_menu=lambda e, d=day, i=it: self._item_menu(e, d, i))
         if items:
             tk.Frame(inner, bg=bg, height=S(6)).pack()
 
@@ -942,12 +1275,13 @@ class ScheduleWidget:
             for it in items:
                 self._render_item(block, bg, L.get("color", C["accent"]), it,
                                   on_edit=lambda L=L, i=it: self.edit_list_item(L, i),
-                                  due_date=from_iso(it.get("due_date")))
+                                  due_date=from_iso(it.get("due_date")),
+                                  on_menu=lambda e, L=L, i=it: self._list_item_menu(e, L, i))
             tk.Frame(block, bg=bg, height=S(6)).pack()
 
         tk.Frame(self.body, bg=C["sep"], height=max(1, S(1))).pack(fill="x", padx=S(12))
 
-    def _render_item(self, parent, bg, color, it, on_edit, due_date=None):
+    def _render_item(self, parent, bg, color, it, on_edit, due_date=None, on_menu=None):
         done = it.get("done", False)
         imp = it.get("important", False)
 
@@ -1005,6 +1339,10 @@ class ScheduleWidget:
             txt.pack(side="left", fill="x", expand=True, padx=(S(6), 0))
             txt.bind("<Button-1>", lambda e: on_edit())
 
+        if on_menu:                                  # 우클릭 메뉴
+            for w in [row] + list(row.winfo_children()):
+                w.bind("<Button-3>", on_menu)
+
     def _cat_color(self, name):
         for c in self.data["categories"]:
             if c["name"] == name:
@@ -1020,6 +1358,122 @@ class ScheduleWidget:
         it["done"] = not it.get("done", False)
         self._commit()
 
+    # ---------- 우클릭 메뉴 ----------
+    def _popup(self, e, entries):
+        m = tk.Menu(self.root, tearoff=0, font=self.f_act, bg=C["bg"], fg=C["text"],
+                    activebackground=C["accent"], activeforeground="#ffffff")
+        for ent in entries:
+            if ent is None:
+                m.add_separator()
+            else:
+                m.add_command(label=ent[0], command=ent[1])
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _item_menu(self, e, day, it):
+        today = dt.date.today()
+        nxt = day + dt.timedelta(days=1)
+        ents = []
+        if day != today:
+            ents.append(("오늘로 옮기기", lambda: self._move(day, it, today)))
+        ents.append(("내일로 미루기" if day == today else
+                     f"다음 날 {nxt.month}/{nxt.day}({WEEKDAYS_KR[nxt.weekday()]})로 미루기",
+                     lambda: self._move(day, it, nxt)))
+        ents.append(("다음 주 같은 요일로", lambda: self._move(day, it, day + dt.timedelta(days=7))))
+        ents.append(None)
+        ents.append(("중요 해제" if it.get("important") else "중요 표시",
+                     lambda: self._flip(it, "important")))
+        ents.append(("D-day 해제" if it.get("due") else "D-day 표시", lambda: self._flip_due(it)))
+        ents.append(None)
+        ents.append(("편집…", lambda: ItemDialog(self, day, it)))
+        ents.append(("삭제", lambda: self.delete_item(day, it)))
+        self._popup(e, ents)
+
+    def _list_item_menu(self, e, L, it):
+        self._popup(e, [
+            ("오늘 할 일로 추가", lambda: self.list_item_to_today(L, it)),
+            None,
+            ("중요 해제" if it.get("important") else "중요 표시", lambda: self._flip(it, "important")),
+            None,
+            ("편집…", lambda: self.edit_list_item(L, it)),
+            ("삭제", lambda: self._delete_list_item(L, it)),
+        ])
+
+    def _flip(self, it, key):
+        it[key] = not it.get(key, False)
+        self._commit()
+
+    def _flip_due(self, it):
+        on = not it.get("due", False)
+        it["due"] = on
+        it["deadline"] = on and (it.get("deadline", False) if it.get("label") else True)
+        self._commit()
+
+    def _move(self, day, it, to):
+        move_item(self.data, iso(day), it, to)
+        self._commit()
+        self._toast(f"{to.month}/{to.day}({WEEKDAYS_KR[to.weekday()]})로 옮김")
+
+    def _delete_list_item(self, L, it):
+        L["items"].remove(it)
+        self._commit()
+
+    def list_item_to_today(self, L, it):
+        today = dt.date.today()
+        ensure_categories(self.data, [L["name"]], color=L.get("color"))
+        self.data["items"].setdefault(iso(today), []).append(
+            {"id": new_id(), "text": it.get("text", ""), "category": L["name"],
+             "important": it.get("important", False), "done": False,
+             "label": None, "due": False, "deadline": False})
+        self._commit()
+        self._toast("오늘 할 일로 추가함")
+
+    # ---------- 이월 / 진행률 / 오늘로 스크롤 ----------
+    def _render_carry(self):
+        today = dt.date.today()
+        if not (self.week_start <= today <= self.week_start + dt.timedelta(days=6)):
+            return
+        cands = carry_over_candidates(self.data, today)
+        if not cands:
+            return
+        bg = C["carry_bg"]
+        bar = tk.Frame(self.body, bg=bg)
+        bar.pack(fill="x")
+        inner = tk.Frame(bar, bg=bg)
+        inner.pack(fill="x", padx=(S(13), S(10)), pady=S(7))
+        tk.Label(inner, text=f"지난 날 못 끝낸 일 {len(cands)}개", font=self.f_date, bg=bg,
+                 fg=C["carry_fg"]).pack(side="left")
+        self._txt(inner, "오늘로 옮기기", self.carry_to_today, font=self.f_act_b,
+                  fg=C["accent"], hi=C["accent_dk"], bg=bg).pack(side="right")
+        tk.Frame(self.body, bg=C["sep"], height=max(1, S(1))).pack(fill="x")
+
+    def carry_to_today(self):
+        n = carry_over(self.data, dt.date.today())
+        self._persist()
+        self.render(focus_today=True)
+        self._toast(f"{n}개를 오늘로 옮김")
+
+    def _set_progress(self, done, total):
+        if not total or not done:
+            self.prog_fill.place_forget()
+            return
+        self.prog_fill.configure(bg=C["good"] if done == total else C["accent"])
+        self.prog_fill.place(x=0, y=0, relheight=1, relwidth=done / total)
+
+    def _scroll_to_today(self):
+        """오늘이 화면 아래로 밀려 있으면 오늘이 맨 위에 오도록 스크롤"""
+        b = self._today_block
+        if self.tab != "week" or b is None or not b.winfo_exists():
+            return
+        self.root.update_idletasks()
+        view_h = self.canvas.winfo_height()
+        total = max(1, self.body.winfo_height())
+        y, h = b.winfo_y(), b.winfo_height()
+        if y + h > view_h and total > view_h:
+            self.canvas.yview_moveto(max(0.0, (y - S(4)) / total))
+
     # ---------- 주간 ----------
     def shift_week(self, delta):
         self.week_start += dt.timedelta(weeks=delta)
@@ -1027,7 +1481,7 @@ class ScheduleWidget:
 
     def goto_today(self):
         self.week_start = monday_of(dt.date.today())
-        self.render()
+        self.render(focus_today=True)
 
     def save_item(self, day, item, text, category, due):
         lst = self.data["items"].setdefault(iso(day), [])
@@ -1113,7 +1567,7 @@ class ScheduleWidget:
         if self.collapsed:
             self.main.pack_forget()
             self.root.update_idletasks()
-            h = self.header.winfo_reqheight() + S(1) + 3
+            h = self.header.winfo_reqheight() + S(3) + 2
             self.root.geometry(f"{self.W}x{h}+{x}+{y}")
         else:
             self.main.pack(fill="both", expand=True)
@@ -1128,85 +1582,20 @@ class ScheduleWidget:
     def open_export(self):
         ExportDialog(self)
 
-    def apply_import(self, text):
-        plan = plan_import(text, self.week_start)
-        inweek, other, lists = plan["inweek"], plan["other"], plan["lists"]
-        if not inweek and not other and not lists:
+    def apply_import(self, text, week_start=None):
+        ws = week_start or self.week_start
+        plan = plan_import(text, ws)
+        if not plan["inweek"] and not plan["other"] and not plan["lists"]:
             self._toast("인식된 항목 없음")
             return False
-
-        def make(e, was_done):
-            return {"id": new_id(), "text": e["text"], "category": e["category"],
-                    "important": e["important"], "done": e["done"] or was_done,
-                    "label": e["label"], "due": e["due"], "deadline": e["deadline"]}
-
-        self._ensure_categories([e["category"] for e in inweek + other])
-
-        # 주간: 보고 있는 주는 메모 내용으로 교체 (같은 날짜·내용이면 완료 체크 유지)
-        if inweek:
-            keys = [iso(self.week_start + dt.timedelta(days=i)) for i in range(7)]
-            was_done = {(k, x.get("text"), x.get("label")) for k in keys
-                        for x in self.data["items"].get(k, []) if x.get("done")}
-            for k in keys:
-                self.data["items"].pop(k, None)
-            for e in inweek:
-                k = iso(e["date"])
-                self.data["items"].setdefault(k, []).append(
-                    make(e, (k, e["text"], e["label"]) in was_done))
-
-        # 다른 주의 날짜 항목(마감 등): 그 날짜에 추가 (이미 있으면 갱신)
-        for e in other:
-            k = iso(e["date"])
-            lst = self.data["items"].setdefault(k, [])
-            ex = next((x for x in lst if x.get("text") == e["text"]
-                       and x.get("label") == e["label"]), None)
-            if ex:
-                ex.update(category=e["category"], important=e["important"],
-                          label=e["label"], due=True, deadline=e["deadline"])
-                if e["done"]:
-                    ex["done"] = True
-            else:
-                lst.append(make(e, False))
-
-        # 전체: 메모의 목록으로 교체 (같은 목록·내용이면 완료 체크, 색, 접힘 유지)
-        if lists:
-            prev = {L["name"]: L for L in self.data["lists"]}
-            was_done = {(L["name"], it.get("text")) for L in self.data["lists"]
-                        for it in L["items"] if it.get("done")}
-            new_lists = []
-            for i, L in enumerate(lists):
-                p = prev.get(L["name"], {})
-                new_lists.append({
-                    "id": p.get("id", new_id()), "name": L["name"],
-                    "color": p.get("color", LIST_PALETTE[i % len(LIST_PALETTE)]),
-                    "folded": p.get("folded", False),
-                    "items": [{"id": new_id(), "text": e["text"], "important": e["important"],
-                               "done": e["done"] or (L["name"], e["text"]) in was_done,
-                               "due_date": e["due_date"]}
-                              for e in L["items"]],
-                })
-            self.data["lists"] = new_lists
-
-        if plan["sections"]:
-            self.data["section_order"] = plan["sections"]
-            self.data["day_sections"] = plan["day_sections"]
-
+        n_week, n_lists = merge_import(self.data, plan, ws)
+        self.week_start = ws
+        self.data["window"]["tab"] = "week"
+        self.set_tab("week", save=False)
         self._persist()
-        self.render()
-        n_week = len(inweek) + len(other)
-        parts = ([f"주간 {n_week}"] if n_week else []) + ([f"목록 {len(lists)}"] if lists else [])
+        parts = ([f"주간 {n_week}"] if n_week else []) + ([f"목록 {n_lists}"] if n_lists else [])
         self._toast(" · ".join(parts) + " 가져옴")
         return True
-
-    def _ensure_categories(self, names):
-        existing = {c["name"] for c in self.data["categories"]}
-        idx = len(self.data["categories"])
-        for n in names:
-            if n and n not in existing:
-                self.data["categories"].append(
-                    {"name": n, "color": IMPORT_PALETTE[idx % len(IMPORT_PALETTE)]})
-                existing.add(n)
-                idx += 1
 
     def copy_to_clipboard(self, text):
         self.root.clipboard_clear()
@@ -1226,7 +1615,7 @@ class ScheduleWidget:
     def _update_worker(self, manual):
         pull = self._git_pull()
         changed = code_signature() != self._sig
-        ok = script_compiles() if changed else True
+        ok = (script_compiles() and tests_pass()) if changed else True
         self.root.after(0, lambda: self._after_update(pull, changed, ok, manual))
 
     def _git_pull(self):
@@ -1258,7 +1647,7 @@ class ScheduleWidget:
         if not manual:
             return
         if changed and not ok:
-            self._toast("새 코드에 오류 — 재시작 안 함", ms=4000)
+            self._toast("새 코드 검사 실패 — 재시작 안 함 (error.log)", ms=5000)
         elif pull == "conflict":
             self._toast("충돌로 받기 실패", ms=4000)
         elif pull in ("error", "no_remote", "no_git"):
@@ -1303,11 +1692,123 @@ class ScheduleWidget:
         if not self.collapsed and self._sb_shown:
             self.canvas.yview_scroll(int(-e.delta / 120), "units")
 
+    # ---------- Win+D 대응 / 전역 단축키 ----------
+    def _hwnd(self):
+        if not self._hwnd_cache and _u32:
+            self._hwnd_cache = _u32.GetAncestor(self.root.winfo_id(), 2)    # GA_ROOT
+        return self._hwnd_cache
+
+    def _set_z(self, top):
+        hwnd = self._hwnd()
+        if hwnd:
+            _u32.SetWindowPos(hwnd, ctypes.c_void_p(-1 if top else -2), 0, 0, 0, 0,
+                              0x0001 | 0x0002 | 0x0010)    # NOSIZE | NOMOVE | NOACTIVATE
+
+    def _watch_desktop(self):
+        """바탕화면 보기(Win+D)로 바탕화면이 맨 앞에 오면 위젯을 그 위로 다시 올림 (0.4초마다)"""
+        if _u32 is None:
+            return
+        try:
+            hwnd = self._hwnd()
+            fg = _u32.GetForegroundWindow()
+            buf = ctypes.create_unicode_buffer(64)
+            if fg:
+                _u32.GetClassNameW(fg, buf, 64)
+            desk = buf.value in ("WorkerW", "Progman")
+            if desk:
+                if not _u32.IsWindowVisible(hwnd) or _u32.IsIconic(hwnd):
+                    _u32.ShowWindow(hwnd, 4)                 # SW_SHOWNOACTIVATE
+                if not self._desk_mode:
+                    self._set_z(True)
+            elif self._summoned:
+                # 단축키로 불러온 뒤: 위젯을 한 번 쓰고 다른 창으로 넘어가면 원래대로
+                if fg == hwnd:
+                    self._summon_own = True
+                elif fg and (fg != self._summon_prev_fg or self._summon_own):
+                    self._summoned = False
+                    if not self.topmost:
+                        self._set_z(False)
+            elif self._desk_mode and not self.topmost:
+                self._set_z(False)
+            self._desk_mode = desk
+        except Exception as e:
+            if not self._watch_logged:
+                self._watch_logged = True
+                log_error("바탕화면 감시 오류", e)
+        self.root.after(400, self._watch_desktop)
+
+    def _start_hotkey(self):
+        if _u32 is None:
+            return
+
+        def run():
+            for _ in range(20):        # 재시작 직후엔 이전 프로세스가 잠깐 잡고 있을 수 있음
+                if _u32.RegisterHotKey(None, 1, HOTKEY_MODS, HOTKEY_VK):
+                    break
+                time.sleep(0.5)
+            else:
+                self.root.after(0, lambda: self._toast(f"단축키 {HOTKEY_LABEL} 사용 불가", ms=6000))
+                return
+            msg = ctypes.wintypes.MSG()
+            while _u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == 0x0312:                    # WM_HOTKEY
+                    self.root.after(0, self.summon)
+        threading.Thread(target=run, daemon=True, name="hotkey").start()
+
+    def summon(self):
+        """단축키: 위젯을 맨 앞으로 불러오기 (이미 앞에 있으면 다시 뒤로)"""
+        hwnd = self._hwnd()
+        if self._summoned and _u32.GetForegroundWindow() == hwnd:
+            self._summoned = False
+            if not self.topmost:
+                self._set_z(False)
+            self.root.lower()
+            return
+        if self.collapsed:
+            self.toggle_collapse()
+        self._summon_prev_fg = _u32.GetForegroundWindow()
+        self._summon_own = False
+        self._summoned = True
+        _u32.ShowWindow(hwnd, 5)                             # SW_SHOW
+        self._set_z(True)
+        _u32.SetForegroundWindow(hwnd)
+        self.root.focus_force()
+
+    # ---------- 오류 처리 ----------
+    def _mark_good(self):
+        """5초간 정상 동작 → 지금 코드를 비상용 이전 버전으로 보관"""
+        try:
+            save_fallback()
+        except Exception as e:
+            log_error("비상용 사본 저장 실패", e)
+
+    def _on_tk_error(self, exc, val, tb):
+        log_error("화면 처리 중 오류", val)
+        try:
+            self._toast("오류가 기록됨 (data/error.log)", ms=4000)
+        except Exception:
+            pass
+
+    def _show_banner(self, msg):
+        """푸터에 다 안 들어가는 중요한 알림을 본문 위에 표시 (✕ 로 닫기)"""
+        if self._banner is not None:
+            self._banner.destroy()
+        b = tk.Frame(self.main, bg=C["danger_bg"])
+        b.pack(side="top", fill="x", before=self.body_wrap)
+        self._txt(b, "✕", b.destroy, font=self.f_status, fg=C["danger_fg"],
+                  hi=C["title"], bg=C["danger_bg"]).pack(side="right", anchor="n",
+                                                           padx=S(10), pady=S(7))
+        tk.Label(b, text=msg, font=self.f_status, bg=C["danger_bg"], fg=C["danger_fg"],
+                 justify="left", anchor="w", wraplength=self.W - S(60)).pack(
+            side="left", fill="x", padx=(S(13), 0), pady=S(7))
+        self._banner = b
+
     def _persist(self):
         try:
             save_data(self.data)
-        except Exception:
-            pass
+        except Exception as e:
+            log_error("저장 실패", e)
+            self._toast("저장 실패 — data/error.log", ms=5000)
 
     def quit(self):
         self._persist()
@@ -1422,12 +1923,32 @@ class ImportDialog:
         self.app = app
         top, wrap = _modal(app)
         self.top = top
-        ws = app.week_start
-        we = ws + dt.timedelta(days=6)
-        _accent_head(wrap, app, f"메모 가져오기 · 주간은 {ws.strftime('%m/%d')}~{we.strftime('%m/%d')}")
+        _accent_head(wrap, app, "메모 가져오기")
 
         inner = tk.Frame(wrap, bg=C["bg"])
         inner.pack(fill="both", expand=True, padx=S(14), pady=S(12))
+
+        # 어느 주에 넣을지: 이번 주 / 다음 주 (+ 다른 주를 보고 있으면 그 주)
+        this_ws = monday_of(dt.date.today())
+        next_ws = this_ws + dt.timedelta(days=7)
+        opts = [(this_ws, "이번 주"), (next_ws, "다음 주")]
+        if app.week_start not in (this_ws, next_ws):
+            opts.append((app.week_start, "보는 주"))
+            self.target = app.week_start
+        elif app.week_start == next_ws or dt.date.today().weekday() >= 5:
+            self.target = next_ws            # 주말엔 보통 다음 주 계획을 씀
+        else:
+            self.target = this_ws
+        seg = tk.Frame(inner, bg=C["bg"])
+        seg.pack(fill="x", pady=(0, S(10)))
+        self.seg_btns = {}
+        for ws_, name in opts:
+            b = tk.Label(seg, text=f"{name} {ws_.month}/{ws_.day}~", font=app.f_act,
+                         padx=S(9), pady=S(3), cursor="hand2")
+            b.pack(side="left", padx=(0, S(5)))
+            b.bind("<Button-1>", lambda e, w=ws_: self._pick_week(w))
+            self.seg_btns[ws_] = b
+        self._style_seg()
 
         tk.Label(inner, text="Sticky Notes 내용을 붙여넣으세요 (Ctrl+V)",
                  font=app.f_act, bg=C["bg"], fg=C["sub"]).pack(anchor="w")
@@ -1448,7 +1969,7 @@ class ImportDialog:
         self.preview.tag_configure("m", foreground=C["muted"])
         self.preview.pack(fill="x", pady=(S(4), S(6)))
 
-        tk.Label(inner, text="※ 이번 주 일정과 전체 목록이 메모 내용으로 바뀝니다 (완료 체크는 유지)",
+        tk.Label(inner, text="※ 선택한 주의 일정과 전체 목록이 메모 내용으로 바뀝니다 (완료 체크는 유지)",
                  font=app.f_status, bg=C["bg"], fg=C["muted"], justify="left",
                  wraplength=S(300)).pack(anchor="w", pady=(0, S(8)))
 
@@ -1471,6 +1992,16 @@ class ImportDialog:
         self.text.focus_set()
         top.bind("<Escape>", lambda e: _close_modal(top))
 
+    def _pick_week(self, ws):
+        self.target = ws
+        self._style_seg()
+        self._refresh()
+
+    def _style_seg(self):
+        for ws_, b in self.seg_btns.items():
+            on = ws_ == self.target
+            b.configure(bg=C["accent"] if on else C["chip_bg"], fg="#ffffff" if on else C["sub"])
+
     def _line(self, e):
         tag = (e["label"] + " · ") if e.get("label") else ""
         t = tag + e["text"]
@@ -1479,7 +2010,7 @@ class ImportDialog:
         return f"  {WEEKDAYS_KR[e['date'].weekday()]} {e['date'].month}/{e['date'].day}   {t}{due}\n"
 
     def _refresh(self):
-        plan = plan_import(self.text.get("1.0", "end"), self.app.week_start)
+        plan = plan_import(self.text.get("1.0", "end"), self.target)
         inweek, other, lists = plan["inweek"], plan["other"], plan["lists"]
         p = self.preview
         p.configure(state="normal")
@@ -1490,7 +2021,7 @@ class ImportDialog:
                             "[혜윰, ~11/29 일]   → 마감 D-day\n\n"
                             "---- [ 종강 후 할 일 ] ----   → 전체 목록\n⦁ 할 일", "m")
         else:
-            p.insert("end", f"이번 주  {len(inweek)}개\n", "h")
+            p.insert("end", f"주간 {self.target.month}/{self.target.day}~  {len(inweek)}개\n", "h")
             for e in inweek:
                 p.insert("end", self._line(e))
             if not inweek:
@@ -1510,7 +2041,7 @@ class ImportDialog:
         self.apply_btn.configure(text=f"적용 ({n})" if n else "적용")
 
     def _apply(self):
-        if self.app.apply_import(self.text.get("1.0", "end")):
+        if self.app.apply_import(self.text.get("1.0", "end"), self.target):
             _close_modal(self.top)
 
 
@@ -1745,12 +2276,26 @@ class ItemDialog:
 
 def main():
     enable_dpi_awareness()
+    install_error_hooks()
     wait = 8 if "--restarted" in sys.argv else 0
     if not acquire_single_instance(wait):
         return      # 이미 실행 중
-    root = tk.Tk()
-    root.title("주간 일정")
-    ScheduleWidget(root)
+    root = None
+    try:
+        root = tk.Tk()
+        root.title("주간 일정")
+        ScheduleWidget(root)
+    except Exception as e:
+        # 시작하다 죽으면: 기록하고, 보관해 둔 이전 버전으로 대신 실행
+        log_error("시작 실패" + (" (비상용 이전 버전)" if FALLBACK_MODE else ""), e)
+        try:
+            if root is not None:
+                root.destroy()
+        except Exception:
+            pass
+        release_single_instance()
+        launch_fallback()
+        return
     root.mainloop()
 
 
