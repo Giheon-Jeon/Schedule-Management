@@ -110,6 +110,7 @@ C = {
     "imp_bg":   "#fff7e6", "imp_fg": "#b45309",
     "carry_bg": "#fffbeb", "carry_fg": "#92400e",
     "good":     "#22c55e",
+    "snack":    "#1f2937", "snack_fg": "#a5b4fc",
 }
 
 # ------------------------------------------------------------------
@@ -214,6 +215,7 @@ def _with_defaults(d):
     d.setdefault("lists", [])          # 전체: [{id,name,color,folded,items:[item]}]
     d.setdefault("section_order", [])  # 메모의 주간 섹션 순서 (내보내기용)
     d.setdefault("day_sections", [])   # <요일> 블록을 쓰는 섹션
+    d.setdefault("recurring", [])      # 반복 일정 규칙
     d.setdefault("window", {})
     return d
 
@@ -580,14 +582,15 @@ def parse_sticky_note(text):
         txt, imp, done = _bullet_text(line)
         if txt in _PLACEHOLDERS:
             continue
+        txt, rep = strip_repeat(txt)
         cat = section or "기타"
         if weekday is not None:
             res["weekday"].append({"widx": weekday, "text": txt, "category": cat,
-                                   "important": imp, "done": done})
+                                   "important": imp, "done": done, "repeat": rep})
         elif cur_date is not None:
             res["dated"].append({"date": cur_date, "text": txt, "category": cat,
                                  "important": imp, "done": done,
-                                 "label": label, "deadline": deadline})
+                                 "label": label, "deadline": deadline, "repeat": False})
             add_section(cat)
     return res
 
@@ -615,6 +618,8 @@ def plan_import(text, week_start):
 # ------------------------------------------------------------------
 def _item_line(it, with_due=False):
     t = it.get("text", "")
+    if it.get("rid"):
+        t += " " + REPEAT_MARK
     if with_due and it.get("due_date"):
         d = from_iso(it["due_date"])
         if d:
@@ -709,15 +714,38 @@ def merge_import(data, plan, week_start):
     ensure_categories(data, [e["category"] for e in inweek + other])
 
     # 주간: 선택한 주는 메모 내용으로 교체 (같은 날짜·내용이면 완료 체크 유지)
+    #  - "(매주)" 항목은 반복 일정으로 연결 (없으면 새로 만듦)
+    #  - 반복 일정은 메모에 없어도 지우지 않음 (자동으로 들어가는 일정이므로)
     if inweek:
         keys = [iso(week_start + dt.timedelta(days=i)) for i in range(7)]
         was_done = {(k, x.get("text"), x.get("label")) for k in keys
                     for x in data["items"].get(k, []) if x.get("done")}
+        prev_rep = [(k, x) for k in keys for x in data["items"].get(k, []) if x.get("rid")]
         for k in keys:
             data["items"].pop(k, None)
         for e in inweek:
             k = iso(e["date"])
-            data["items"].setdefault(k, []).append(make(e, (k, e["text"], e["label"]) in was_done))
+            it = make(e, (k, e["text"], e["label"]) in was_done)
+            same = next((x for pk, x in prev_rep if pk == k and x.get("text") == e["text"]), None)
+            if same is not None:
+                it.update(rid=same["rid"], rdate=same.get("rdate", k))
+            elif e.get("repeat"):
+                r = next((r for r in data["recurring"]
+                          if r["text"] == e["text"] and r["category"] == e["category"]
+                          and (not r.get("end") or r["end"] >= k)), None)
+                if r is None:
+                    r = add_recurring(data, e["text"], e["category"], [], e["date"])
+                if e["date"].weekday() not in r["weekdays"]:
+                    r["weekdays"] = sorted(r["weekdays"] + [e["date"].weekday()])
+                r["start"] = min(r["start"], k)
+                if k in r.get("skip", []):
+                    r["skip"].remove(k)
+                it.update(rid=r["id"], rdate=k)
+            data["items"].setdefault(k, []).append(it)
+        have = _occurrences(data)
+        for k, x in prev_rep:
+            if (x["rid"], x.get("rdate")) not in have:
+                data["items"].setdefault(k, []).append(x)
 
     # 다른 주의 날짜 항목(마감 등): 그 날짜에 추가 (이미 있으면 갱신)
     for e in other:
@@ -767,12 +795,14 @@ def move_item(data, from_key, item, to_date):
 
 
 def carry_over_candidates(data, today, days=30):
-    """오늘 이전(최근 days일) 날짜의 미완료 항목 — D-day 항목은 날짜가 의미 있으므로 제외"""
+    """오늘 이전(최근 days일) 날짜의 미완료 항목 — D-day 항목(날짜가 의미 있음)과
+    반복 일정(어차피 또 돌아옴)은 제외"""
     out = []
     for k, lst in data["items"].items():
         d = from_iso(k)
         if d and d < today and (today - d).days <= days:
-            out += [(k, it) for it in lst if not it.get("done") and not it.get("due")]
+            out += [(k, it) for it in lst
+                    if not it.get("done") and not it.get("due") and not it.get("rid")]
     return sorted(out, key=lambda x: x[0])
 
 
@@ -794,6 +824,174 @@ def list_progress(data):
     return sum(1 for it in items if it.get("done")), len(items)
 
 
+def reorder_item(data, from_key, item, to_key, index):
+    """주간 항목을 to_key 날짜의 index 위치로 (같은 날이면 순서만 바꿈)"""
+    src = data["items"].get(from_key, [])
+    if from_key == to_key:
+        old = next((i for i, x in enumerate(src) if x is item), None)
+        if old is not None and old < index:
+            index -= 1
+    data["items"][from_key] = [x for x in src if x is not item]
+    if not data["items"][from_key]:
+        data["items"].pop(from_key, None)
+    dst = data["items"].setdefault(to_key, [])
+    dst.insert(max(0, min(index, len(dst))), item)
+
+
+def move_list_item(src, item, dst, index):
+    """전체 목록 항목을 dst 목록의 index 위치로"""
+    if src is dst:
+        old = next((i for i, x in enumerate(src["items"]) if x is item), None)
+        if old is not None and old < index:
+            index -= 1
+    src["items"] = [x for x in src["items"] if x is not item]
+    dst["items"].insert(max(0, min(index, len(dst["items"]))), item)
+
+
+# ------------------------------------------------------------------
+# 반복 일정 (매주 같은 요일)
+#   규칙: data["recurring"] = [{id, text, category, weekdays, start, end, skip}]
+#   주를 볼 때 그 주의 항목을 실제로 만들어 둠(rid=규칙, rdate=원래 날짜) →
+#   완료 체크·옮기기·메모 내보내기가 보통 항목과 똑같이 동작
+# ------------------------------------------------------------------
+REPEAT_MARK = "(매주)"
+_RE_REPEAT = re.compile(r"\s*\((?:매주|반복)\)\s*$")
+
+
+def strip_repeat(text):
+    m = _RE_REPEAT.search(text)
+    return (text[:m.start()].strip(), True) if m else (text, False)
+
+
+def find_rule(data, rid):
+    return next((r for r in data["recurring"] if r["id"] == rid), None)
+
+
+def add_recurring(data, text, category, weekdays, start):
+    r = {"id": new_id(), "text": text, "category": category,
+         "weekdays": sorted(set(weekdays)), "start": iso(start), "end": None, "skip": []}
+    data["recurring"].append(r)
+    return r
+
+
+def _occurrences(data):
+    return {(it["rid"], it.get("rdate")) for lst in data["items"].values()
+            for it in lst if it.get("rid")}
+
+
+def materialize_recurring(data, start, end):
+    """start~end 사이 반복 일정 항목을 만들어 둠 (이미 있거나 지운 날은 건너뜀). 반환: 만든 개수"""
+    if not data["recurring"]:
+        return 0
+    have = _occurrences(data)
+    n = 0
+    d = start
+    while d <= end:
+        k = iso(d)
+        for r in data["recurring"]:
+            if (d.weekday() in r["weekdays"] and r["start"] <= k
+                    and (not r.get("end") or k <= r["end"])
+                    and k not in r.get("skip", []) and (r["id"], k) not in have):
+                data["items"].setdefault(k, []).append(
+                    {"id": new_id(), "text": r["text"], "category": r["category"],
+                     "done": False, "important": False, "label": None, "due": False,
+                     "deadline": False, "rid": r["id"], "rdate": k})
+                have.add((r["id"], k))
+                n += 1
+        d += dt.timedelta(days=1)
+    return n
+
+
+def skip_occurrence(data, item):
+    """반복 항목 하나를 지울 때: 그 날은 다시 만들지 않도록 기록"""
+    r = find_rule(data, item.get("rid"))
+    if r and item.get("rdate") and item["rdate"] not in r.setdefault("skip", []):
+        r["skip"].append(item["rdate"])
+
+
+def _drop_future(data, rid, after_key, keep=lambda it: False):
+    """rid 반복 항목 중 원래 날짜가 after_key 이후이고 완료 안 된 것을 지움"""
+    for k in list(data["items"]):
+        lst = [it for it in data["items"][k]
+               if not (it.get("rid") == rid and (it.get("rdate") or k) > after_key
+                       and not it.get("done") and not keep(it))]
+        if lst:
+            data["items"][k] = lst
+        else:
+            data["items"].pop(k)
+
+
+def end_recurring(data, rid, last_day):
+    """last_day 까지만 하고 반복 끝내기 (그 뒤의 미완료 항목은 지움)"""
+    r = find_rule(data, rid)
+    if r:
+        r["end"] = iso(last_day)
+        _drop_future(data, rid, iso(last_day))
+
+
+def update_recurring(data, rid, from_day, text, category, weekdays):
+    """from_day 이후 반복 일정의 내용·요일 변경 (이미 완료한 항목은 그대로)"""
+    r = find_rule(data, rid)
+    if not r:
+        return
+    k0 = iso(from_day)
+    if not weekdays:
+        end_recurring(data, rid, from_day)
+        return
+    r.update(text=text, category=category, weekdays=sorted(set(weekdays)))
+    _drop_future(data, rid, k0,
+                 keep=lambda it: (from_iso(it.get("rdate")) or from_day).weekday() in r["weekdays"])
+    for lst in data["items"].values():
+        for it in lst:
+            if it.get("rid") == rid and (it.get("rdate") or "") >= k0 and not it.get("done"):
+                it.update(text=text, category=category)
+
+
+# ------------------------------------------------------------------
+# 실행 취소 / 다시 실행 (창 위치 같은 설정은 제외하고 내용만 기억)
+# ------------------------------------------------------------------
+def _content(data):
+    return json.dumps({k: v for k, v in data.items() if k != "window"},
+                      ensure_ascii=False, sort_keys=True)
+
+
+class History:
+    def __init__(self, data, limit=40):
+        self.limit = limit
+        self.undo_stack, self.redo_stack = [], []
+        self._cur = _content(data)
+
+    def record(self, data, label):
+        """바뀐 게 있으면 바뀌기 전 상태를 기억. 반환: 기록 여부"""
+        s = _content(data)
+        if s == self._cur:
+            return False
+        if label is None:              # 자동 생성(반복 일정 등) — 되돌릴 대상 아님
+            self._cur = s
+            return False
+        self.undo_stack.append((label, self._cur))
+        del self.undo_stack[:-self.limit]
+        self.redo_stack.clear()
+        self._cur = s
+        return True
+
+    def _swap(self, data, src, dst):
+        if not src:
+            return None
+        label, s = src.pop()
+        dst.append((label, self._cur))
+        self._cur = s
+        new = json.loads(s)
+        new["window"] = data.get("window", {})
+        return label, _with_defaults(new)
+
+    def undo(self, data):
+        return self._swap(data, self.undo_stack, self.redo_stack)
+
+    def redo(self, data):
+        return self._swap(data, self.redo_stack, self.undo_stack)
+
+
 # ------------------------------------------------------------------
 # 메인 앱
 # ------------------------------------------------------------------
@@ -805,6 +1003,8 @@ class ScheduleWidget:
         self.W, self.H = S(W_WIDTH), S(W_HEIGHT)
 
         self.data, notice = load_data()
+        self.history = History(self.data)
+        self._dnd = None
         try:
             backup_daily()
         except Exception as e:
@@ -836,6 +1036,10 @@ class ScheduleWidget:
         self.set_tab(self.tab, save=False)
 
         root.bind("<MouseWheel>", self._on_wheel)
+        root.bind("<Control-KeyPress>", self._on_ctrl_key)       # Ctrl+Z / Ctrl+Y (한/영 무관)
+        root.bind("<Button-1>", self._take_focus, add="+")
+        root.bind("<Button-3>", self._bg_menu)
+        root.bind("<Escape>", self._dnd_cancel)
         root.protocol("WM_DELETE_WINDOW", self.quit)
         root.report_callback_exception = self._on_tk_error
         root.after(150, self._scroll_to_today)
@@ -1029,6 +1233,20 @@ class ScheduleWidget:
         self.body.bind("<Configure>", lambda e: self._update_scroll())
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
+        # 되돌리기 알림줄 (본문 아래쪽에 잠깐 떠 있음)
+        sb = C["snack"]
+        self.snack = tk.Frame(self.main, bg=sb)
+        self.snack_msg = tk.Label(self.snack, text="", font=self.f_act, bg=sb, fg="#ffffff",
+                                  anchor="w")
+        self.snack_btn = tk.Label(self.snack, text="", font=self.f_act_b, bg=sb,
+                                  fg=C["snack_fg"], cursor="hand2")
+        self.snack_btn.pack(side="right", padx=(S(8), S(12)))
+        self.snack_msg.pack(side="left", fill="x", expand=True, padx=(S(12), 0), pady=S(7))
+        self.snack_btn.bind("<Enter>", lambda e: self.snack_btn.configure(fg="#ffffff"))
+        self.snack_btn.bind("<Leave>", lambda e: self.snack_btn.configure(fg=C["snack_fg"]))
+        self.snack_btn.bind("<Button-1>", lambda e: self._snack_click())
+        self._snack_cmd = self._snack_job = None
+
         self.collapsed = False
         if self.data["window"].get("collapsed"):
             self.toggle_collapse()
@@ -1078,11 +1296,17 @@ class ScheduleWidget:
         return f"{ws.strftime(fmt)}  –  {we.strftime('%m.%d')}"
 
     def render(self, keep_scroll=False, focus_today=False):
+        if self._dnd:
+            self._dnd_cleanup()
         pos = self.canvas.yview()[0] if keep_scroll else 0.0
         for ch in self.body.winfo_children():
             ch.destroy()
         self._today_block = None
+        self._dnd_targets = []
         if self.tab == "week":
+            if materialize_recurring(self.data, self.week_start,
+                                     self.week_start + dt.timedelta(days=6)):
+                self._persist(None)
             self.lbl_week.configure(text=self._week_range_text())
             done, total = week_progress(self.data, self.week_start)
             self.lbl_prog.configure(text=f"·  {done}/{total} 완료" if total else "")
@@ -1214,11 +1438,14 @@ class ScheduleWidget:
         self._txt(head, "＋", lambda d=day: ItemDialog(self, d, None), font=self.f_add,
                   fg=C["muted"], hi=C["accent"], bg=bg).pack(side="right")
 
+        target = {"kind": "day", "key": iso(day), "block": block, "rows": [], "count": 0}
+        self._dnd_targets.append(target)
         for it in items:
             self._render_item(inner, bg, self._cat_color(it.get("category")), it,
                               on_edit=lambda d=day, i=it: ItemDialog(self, d, i),
                               due_date=day if it.get("due") else None,
-                              on_menu=lambda e, d=day, i=it: self._item_menu(e, d, i))
+                              on_menu=lambda e, d=day, i=it: self._item_menu(e, d, i),
+                              drag=target)
         if items:
             tk.Frame(inner, bg=bg, height=S(6)).pack()
 
@@ -1268,6 +1495,9 @@ class ScheduleWidget:
         self._txt(head, "편집", lambda L=L: self.edit_list(L), font=self.f_status,
                   fg=C["muted"], hi=C["accent"]).pack(side="right", padx=(0, S(10)))
 
+        target = {"kind": "list", "key": L, "block": block, "rows": [],
+                  "count": len(items) if folded else 0}
+        self._dnd_targets.append(target)
         if not folded:
             if not items:
                 tk.Label(block, text="할 일 없음", font=self.f_status, bg=bg,
@@ -1276,12 +1506,14 @@ class ScheduleWidget:
                 self._render_item(block, bg, L.get("color", C["accent"]), it,
                                   on_edit=lambda L=L, i=it: self.edit_list_item(L, i),
                                   due_date=from_iso(it.get("due_date")),
-                                  on_menu=lambda e, L=L, i=it: self._list_item_menu(e, L, i))
+                                  on_menu=lambda e, L=L, i=it: self._list_item_menu(e, L, i),
+                                  drag=target)
             tk.Frame(block, bg=bg, height=S(6)).pack()
 
         tk.Frame(self.body, bg=C["sep"], height=max(1, S(1))).pack(fill="x", padx=S(12))
 
-    def _render_item(self, parent, bg, color, it, on_edit, due_date=None, on_menu=None):
+    def _render_item(self, parent, bg, color, it, on_edit, due_date=None, on_menu=None,
+                     drag=None):
         done = it.get("done", False)
         imp = it.get("important", False)
 
@@ -1301,6 +1533,8 @@ class ScheduleWidget:
             right.append((t, b, f))
         if imp and not done:
             right.append(("중요", C["imp_bg"], C["imp_fg"]))
+        if it.get("rid") and not done:
+            right.append(("매주", C["chip_bg"], C["sub"]))
 
         row = tk.Frame(parent, bg=bg)
         row.pack(fill="x", padx=(S(13), S(10)), pady=S(2))
@@ -1318,7 +1552,6 @@ class ScheduleWidget:
             lbl = self._badge(row, c, cb, cf)
             lbl.configure(cursor="hand2")
             lbl.pack(side="left", anchor="n", padx=(S(7), 0), pady=(tag_off, 0))
-            lbl.bind("<Button-1>", lambda e: on_edit())
 
         for t, b, f in right:
             self._badge(row, t, b, f).pack(side="right", anchor="n",
@@ -1337,11 +1570,22 @@ class ScheduleWidget:
                            anchor="w", justify="left",
                            wraplength=max(S(80), self.W - S(85) - extra))
             txt.pack(side="left", fill="x", expand=True, padx=(S(6), 0))
-            txt.bind("<Button-1>", lambda e: on_edit())
+
+        # 누르면 편집, 끌면 옮기기 (체크박스는 제외)
+        parts = [w for w in [row] + list(row.winfo_children()) if w is not chk]
+        for w in parts:
+            if drag is not None:
+                w.bind("<ButtonPress-1>", lambda e, r=row: self._dnd_press(e, drag, it, r))
+                w.bind("<B1-Motion>", self._dnd_motion)
+                w.bind("<ButtonRelease-1>", lambda e: self._dnd_release(e, on_edit))
+            elif isinstance(w, tk.Label):
+                w.bind("<Button-1>", lambda e: on_edit())
+        if drag is not None:
+            drag["rows"].append((row, it))
 
         if on_menu:                                  # 우클릭 메뉴
             for w in [row] + list(row.winfo_children()):
-                w.bind("<Button-3>", on_menu)
+                w.bind("<Button-3>", lambda e: (on_menu(e), "break")[1])
 
     def _cat_color(self, name):
         for c in self.data["categories"]:
@@ -1350,13 +1594,13 @@ class ScheduleWidget:
         return "#94a3b8"
 
     # ---------- 공통 동작 ----------
-    def _commit(self):
-        self._persist()
+    def _commit(self, label="변경"):
+        self._persist(label)
         self.render(keep_scroll=True)
 
     def toggle_done(self, it):
         it["done"] = not it.get("done", False)
-        self._commit()
+        self._commit("완료 체크" if it["done"] else "완료 해제")
 
     # ---------- 우클릭 메뉴 ----------
     def _popup(self, e, entries):
@@ -1366,7 +1610,10 @@ class ScheduleWidget:
             if ent is None:
                 m.add_separator()
             else:
-                m.add_command(label=ent[0], command=ent[1])
+                label, cmd = ent[0], ent[1]
+                on = ent[2] if len(ent) > 2 else True
+                m.add_command(label=label, command=cmd, state="normal" if on else "disabled",
+                              accelerator=ent[3] if len(ent) > 3 else "")
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
@@ -1381,14 +1628,20 @@ class ScheduleWidget:
         ents.append(("내일로 미루기" if day == today else
                      f"다음 날 {nxt.month}/{nxt.day}({WEEKDAYS_KR[nxt.weekday()]})로 미루기",
                      lambda: self._move(day, it, nxt)))
-        ents.append(("다음 주 같은 요일로", lambda: self._move(day, it, day + dt.timedelta(days=7))))
+        if not it.get("rid"):
+            ents.append(("다음 주 같은 요일로",
+                         lambda: self._move(day, it, day + dt.timedelta(days=7))))
         ents.append(None)
         ents.append(("중요 해제" if it.get("important") else "중요 표시",
                      lambda: self._flip(it, "important")))
         ents.append(("D-day 해제" if it.get("due") else "D-day 표시", lambda: self._flip_due(it)))
         ents.append(None)
         ents.append(("편집…", lambda: ItemDialog(self, day, it)))
-        ents.append(("삭제", lambda: self.delete_item(day, it)))
+        if it.get("rid"):
+            ents.append(("반복 끝내기 (이번이 마지막)", lambda: self.stop_repeat(day, it)))
+            ents.append(("이번만 삭제", lambda: self.delete_item(day, it)))
+        else:
+            ents.append(("삭제", lambda: self.delete_item(day, it)))
         self._popup(e, ents)
 
     def _list_item_menu(self, e, L, it):
@@ -1403,22 +1656,28 @@ class ScheduleWidget:
 
     def _flip(self, it, key):
         it[key] = not it.get(key, False)
-        self._commit()
+        self._commit("중요 표시" if it[key] else "중요 해제")
 
     def _flip_due(self, it):
         on = not it.get("due", False)
         it["due"] = on
         it["deadline"] = on and (it.get("deadline", False) if it.get("label") else True)
-        self._commit()
+        self._commit("D-day 표시" if on else "D-day 해제")
 
     def _move(self, day, it, to):
         move_item(self.data, iso(day), it, to)
-        self._commit()
-        self._toast(f"{to.month}/{to.day}({WEEKDAYS_KR[to.weekday()]})로 옮김")
+        self._commit("옮기기")
+        self._undoable(f"{to.month}/{to.day}({WEEKDAYS_KR[to.weekday()]})로 옮김")
 
     def _delete_list_item(self, L, it):
         L["items"].remove(it)
-        self._commit()
+        self._commit("삭제")
+        self._undoable("삭제함")
+
+    def stop_repeat(self, day, it):
+        end_recurring(self.data, it["rid"], day)
+        self._commit("반복 끝내기")
+        self._undoable("반복 끝냄")
 
     def list_item_to_today(self, L, it):
         today = dt.date.today()
@@ -1427,8 +1686,8 @@ class ScheduleWidget:
             {"id": new_id(), "text": it.get("text", ""), "category": L["name"],
              "important": it.get("important", False), "done": False,
              "label": None, "due": False, "deadline": False})
-        self._commit()
-        self._toast("오늘 할 일로 추가함")
+        self._commit("오늘 할 일로 추가")
+        self._undoable("오늘 할 일로 추가함")
 
     # ---------- 이월 / 진행률 / 오늘로 스크롤 ----------
     def _render_carry(self):
@@ -1451,9 +1710,9 @@ class ScheduleWidget:
 
     def carry_to_today(self):
         n = carry_over(self.data, dt.date.today())
-        self._persist()
+        self._persist("못 끝낸 일 옮기기")
         self.render(focus_today=True)
-        self._toast(f"{n}개를 오늘로 옮김")
+        self._undoable(f"{n}개를 오늘로 옮김")
 
     def _set_progress(self, done, total):
         if not total or not done:
@@ -1483,31 +1742,55 @@ class ScheduleWidget:
         self.week_start = monday_of(dt.date.today())
         self.render(focus_today=True)
 
-    def save_item(self, day, item, text, category, due):
-        lst = self.data["items"].setdefault(iso(day), [])
+    def save_item(self, day, item, text, category, due, weekdays=()):
+        """weekdays: 매주 반복할 요일 (비어 있으면 반복 안 함)"""
+        weekdays = sorted(set(weekdays))
         if item is None:
-            lst.append({"id": new_id(), "text": text, "category": category,
-                        "done": False, "due": due, "deadline": due})
-        else:
-            if due and not item.get("due"):
-                item["deadline"] = True
-            item.update(text=text, category=category, due=due)
-            if not due:
-                item["deadline"] = False
-        self._commit()
+            if weekdays:
+                r = add_recurring(self.data, text, category, weekdays, day)
+                materialize_recurring(self.data, day, self.week_start + dt.timedelta(days=6))
+                for lst in self.data["items"].values():     # 그날 항목에 D-day 반영
+                    for it in lst:
+                        if due and it.get("rid") == r["id"] and it.get("rdate") == iso(day):
+                            it.update(due=True, deadline=True)
+                self._commit("반복 일정 추가")
+                days = "".join(WEEKDAYS_KR[i] for i in weekdays)
+                self._undoable(f"매주 {days} 반복 추가")
+                return
+            self.data["items"].setdefault(iso(day), []).append(
+                {"id": new_id(), "text": text, "category": category,
+                 "done": False, "due": due, "deadline": due})
+            self._commit("추가")
+            return
+        if due and not item.get("due"):
+            item["deadline"] = True
+        item.update(text=text, category=category, due=due)
+        if not due:
+            item["deadline"] = False
+        if item.get("rid"):
+            if find_rule(self.data, item["rid"]):
+                update_recurring(self.data, item["rid"], day, text, category, weekdays)
+        elif weekdays:                                       # 보통 일정을 반복으로 바꿈
+            r = add_recurring(self.data, text, category, weekdays, day)
+            if day.weekday() in weekdays:
+                item.update(rid=r["id"], rdate=iso(day))
+        self._commit("편집")
 
     def delete_item(self, day, item):
         key = iso(day)
+        if item.get("rid"):
+            skip_occurrence(self.data, item)
         self.data["items"][key] = [x for x in self.data["items"].get(key, [])
                                    if x.get("id") != item.get("id")]
         if not self.data["items"][key]:
             self.data["items"].pop(key, None)
-        self._commit()
+        self._commit("삭제")
+        self._undoable("삭제함")
 
     # ---------- 전체 목록 ----------
     def toggle_fold(self, L):
         L["folded"] = not L.get("folded", False)
-        self._commit()
+        self._commit("목록 접기" if L["folded"] else "목록 펼치기")
 
     def new_list(self):
         def save(name, _imp, _due):
@@ -1518,17 +1801,18 @@ class ScheduleWidget:
                                        "folded": False, "items": []})
             if self.tab != "all":
                 self.set_tab("all")
-            self._commit()
+            self._commit("새 목록")
         TextDialog(self, "새 목록", "", save, field_label="목록 이름")
 
     def edit_list(self, L):
         def save(name, _imp, _due):
             L["name"] = name
-            self._commit()
+            self._commit("목록 이름 변경")
 
         def delete():
             self.data["lists"].remove(L)
-            self._commit()
+            self._commit("목록 삭제")
+            self._undoable(f"'{L['name']}' 목록 삭제함")
         TextDialog(self, "목록 편집", L["name"], save, on_delete=delete,
                    delete_label="목록 삭제", confirm_delete=True, field_label="목록 이름")
 
@@ -1537,18 +1821,19 @@ class ScheduleWidget:
             L["items"].append({"id": new_id(), "text": text, "important": imp,
                                "done": False, "due_date": due})
             L["folded"] = False
-            self._commit()
+            self._commit("추가")
         TextDialog(self, f"할 일 추가 · {L['name']}", "", save, important=False,
                    show_due=True)
 
     def edit_list_item(self, L, it):
         def save(text, imp, due):
             it.update(text=text, important=imp, due_date=due)
-            self._commit()
+            self._commit("편집")
 
         def delete():
             L["items"].remove(it)
-            self._commit()
+            self._commit("삭제")
+            self._undoable("삭제함")
         TextDialog(self, f"할 일 편집 · {L['name']}", it.get("text", ""), save,
                    on_delete=delete, important=it.get("important", False),
                    show_due=True, due=it.get("due_date"))
@@ -1589,12 +1874,13 @@ class ScheduleWidget:
             self._toast("인식된 항목 없음")
             return False
         n_week, n_lists = merge_import(self.data, plan, ws)
+        self._persist("메모 가져오기")
         self.week_start = ws
         self.data["window"]["tab"] = "week"
         self.set_tab("week", save=False)
-        self._persist()
+        self._persist(None)
         parts = ([f"주간 {n_week}"] if n_week else []) + ([f"목록 {n_lists}"] if n_lists else [])
-        self._toast(" · ".join(parts) + " 가져옴")
+        self._undoable("·".join(parts) + " 가져옴")
         return True
 
     def copy_to_clipboard(self, text):
@@ -1655,11 +1941,86 @@ class ScheduleWidget:
         else:
             self._toast("이미 최신 버전")
 
-    def _toast(self, msg, ms=2600):
+    def _toast(self, msg, ms=2600, action=None):
+        """짧은 알림은 푸터에, 누를 수 있는 동작(action=(글자, 함수))이 있으면 알림줄로"""
+        if action:
+            self._snack(msg, action)
+            return
         self.lbl_status.configure(text=msg)
         if self._toast_job:
             self.root.after_cancel(self._toast_job)
         self._toast_job = self.root.after(ms, lambda: self.lbl_status.configure(text=""))
+
+    def _snack(self, msg, action, ms=6000):
+        self._snack_cmd = action[1]
+        room = self.W - S(20 + 32) - self.f_act_b.measure(action[0])
+        self.snack_msg.configure(text=self._ellipsize(msg, self.f_act, room))
+        self.snack_btn.configure(text=action[0])
+        self.snack.place(in_=self.body_wrap, relx=0.5, rely=1.0, anchor="s",
+                         relwidth=1.0, width=-S(20), y=-S(8))
+        self.snack.lift()
+        if self._snack_job:
+            self.root.after_cancel(self._snack_job)
+        self._snack_job = self.root.after(ms, self._hide_snack)
+
+    def _hide_snack(self):
+        self._snack_job = self._snack_cmd = None
+        self.snack.place_forget()
+
+    def _snack_click(self):
+        cmd = self._snack_cmd
+        self._hide_snack()
+        if cmd:
+            cmd()
+
+    def _undoable(self, msg):
+        """되돌리기 버튼이 붙은 알림"""
+        self._toast(msg, action=("되돌리기", self.undo))
+
+    # ---------- 실행 취소 ----------
+    def undo(self):
+        self._history_step(self.history.undo, "되돌림", ("다시 실행", self.redo))
+
+    def redo(self):
+        self._history_step(self.history.redo, "다시 실행함", ("되돌리기", self.undo))
+
+    def _history_step(self, fn, verb, action):
+        if self._dnd:
+            return
+        res = fn(self.data)
+        if res is None:
+            self._toast("되돌릴 내용 없음" if verb == "되돌림" else "다시 실행할 내용 없음")
+            return
+        label, self.data = res
+        self._persist(None)
+        self.render(keep_scroll=True)
+        self._toast(f"{verb} · {label}", action=action)
+
+    def _on_ctrl_key(self, e):
+        if e.keycode == 90:                                 # Z (Shift 함께면 다시 실행)
+            self.redo() if e.state & 0x1 else self.undo()
+            return "break"
+        if e.keycode == 89:                                 # Y
+            self.redo()
+            return "break"
+
+    def _take_focus(self, e):
+        """클릭하면 키보드 입력(Ctrl+Z)을 받을 수 있게"""
+        if self.root.focus_get() is None:
+            try:
+                self.root.focus_force()
+            except tk.TclError:
+                pass
+
+    def _bg_menu(self, e):
+        """빈 곳 우클릭: 되돌리기 / 다시 실행"""
+        h = self.history
+        self._popup(e, [
+            ("되돌리기" + (f" · {h.undo_stack[-1][0]}" if h.undo_stack else ""), self.undo,
+             bool(h.undo_stack), "Ctrl+Z"),
+            ("다시 실행" + (f" · {h.redo_stack[-1][0]}" if h.redo_stack else ""), self.redo,
+             bool(h.redo_stack), "Ctrl+Y"),
+        ])
 
     def _restart(self):
         self._persist()
@@ -1674,6 +2035,160 @@ class ScheduleWidget:
             self._toast("재시작 실패 — 직접 다시 실행", ms=5000)
             return
         self.root.destroy()
+
+    # ---------- 끌어서 옮기기 (항목 순서 / 다른 요일·목록으로) ----------
+    def _dnd_press(self, e, target, it, row):
+        self._dnd_cand = {"x": e.x_root, "y": e.y_root, "target": target, "item": it, "row": row}
+
+    def _dnd_motion(self, e):
+        c = getattr(self, "_dnd_cand", None)
+        if c is None:
+            return
+        if self._dnd is None:
+            if abs(e.x_root - c["x"]) < S(6) and abs(e.y_root - c["y"]) < S(6):
+                return
+            self._dnd_begin(c)
+        self._dnd_update(e.x_root, e.y_root)
+
+    def _dnd_release(self, e, click):
+        c, self._dnd_cand = getattr(self, "_dnd_cand", None), None
+        if self._dnd is None:
+            if c is not None and click:
+                click()
+            return
+        self._dnd_finish(e.x_root, e.y_root)
+
+    def _dnd_begin(self, c):
+        row, it = c["row"], c["item"]
+        kids = row.winfo_children()
+        color = kids[0].cget("bg") if kids else C["accent"]
+        for w in kids:                                   # 원래 자리는 흐리게
+            if isinstance(w, tk.Label):
+                w.configure(fg=C["muted"])
+        g = tk.Toplevel(self.root)
+        g.overrideredirect(True)
+        g.attributes("-topmost", True)
+        try:
+            g.attributes("-alpha", 0.92)
+        except tk.TclError:
+            pass
+        g.configure(bg=C["accent"])
+        box = tk.Frame(g, bg=C["bg"])
+        box.pack(padx=1, pady=1)
+        tk.Frame(box, bg=color, width=S(3)).pack(side="left", fill="y")
+        tk.Label(box, text=self._ellipsize(it.get("text", ""), self.f_item, S(220)),
+                 font=self.f_item, bg=C["bg"], fg=C["text"],
+                 padx=S(8), pady=S(3)).pack(side="left")
+        line = tk.Frame(self.body, bg=C["accent"], height=S(2))
+        self._dnd = {"src": c["target"], "item": it, "ghost": g, "line": line,
+                     "drop": None, "edge": 0, "pos": (c["x"], c["y"]), "job": None}
+        self._dnd["job"] = self.root.after(30, self._dnd_autoscroll)
+
+    def _dnd_update(self, x, y):
+        d = self._dnd
+        d["pos"] = (x, y)
+        g = d["ghost"]
+        g.geometry(f"+{x + S(14)}+{y - g.winfo_reqheight() // 2}")
+        g.lift()
+        cv = self.canvas
+        cx, cy, cw, ch = cv.winfo_rootx(), cv.winfo_rooty(), cv.winfo_width(), cv.winfo_height()
+        near_x = cx - S(60) <= x <= cx + cw + S(60)
+        d["edge"] = 0
+        if near_x and y < cy + S(28):
+            d["edge"] = -1
+        elif near_x and y > cy + ch - S(28):
+            d["edge"] = 1
+        drop = None
+        if near_x and cy <= y <= cy + ch:
+            tgt = None
+            for t in self._dnd_targets:
+                if t["block"].winfo_rooty() <= y:
+                    tgt = t
+                else:
+                    break
+            if tgt and y <= tgt["block"].winfo_rooty() + tgt["block"].winfo_height() + S(4):
+                rows = tgt["rows"]
+                idx = sum(1 for r, _ in rows if r.winfo_rooty() + r.winfo_height() / 2 < y)
+                if rows and idx < len(rows):
+                    ly = rows[idx][0].winfo_rooty() - S(2)
+                elif rows:
+                    r = rows[-1][0]
+                    ly = r.winfo_rooty() + r.winfo_height() + S(1)
+                else:
+                    b = tgt["block"]
+                    ly = b.winfo_rooty() + b.winfo_height() - S(5)
+                    idx = tgt["count"]
+                drop = (tgt, idx)
+                d["line"].place(x=S(16), y=ly - self.body.winfo_rooty(), relwidth=1,
+                                width=-S(28), height=S(2))
+                d["line"].lift()
+        if drop is None:
+            d["line"].place_forget()
+        d["drop"] = drop
+
+    def _dnd_autoscroll(self):
+        d = self._dnd
+        if d is None:
+            return
+        if d["edge"] and self._sb_shown:
+            top = self.canvas.yview()[0]
+            self.canvas.yview_moveto(top + d["edge"] * S(8) / max(1, self.body.winfo_height()))
+            self._dnd_update(*d["pos"])
+        d["job"] = self.root.after(30, self._dnd_autoscroll)
+
+    def _dnd_cleanup(self):
+        d, self._dnd = self._dnd, None
+        if d is None:
+            return
+        if d["job"]:
+            self.root.after_cancel(d["job"])
+        for w in (d["ghost"], d["line"]):
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        return d
+
+    def _dnd_cancel(self, e=None):
+        if self._dnd:
+            self._dnd_cleanup()
+            self.render(keep_scroll=True)
+
+    def _dnd_finish(self, x, y):
+        self._dnd_update(x, y)
+        d = self._dnd_cleanup()
+        if not d["drop"]:
+            self.render(keep_scroll=True)
+            return
+        (tgt, index), src, it = d["drop"], d["src"], d["item"]
+        if src["kind"] != tgt["kind"]:
+            self.render(keep_scroll=True)
+            return
+        if tgt["kind"] == "day":
+            cur = self.data["items"].get(src["key"], [])
+        else:
+            cur = src["key"]["items"]
+        old = next((i for i, x in enumerate(cur) if x is it), None)
+        same = (src["key"] == tgt["key"]) if tgt["kind"] == "day" else (src["key"] is tgt["key"])
+        if same:
+            if old is None or index in (old, old + 1):      # 제자리
+                self.render(keep_scroll=True)
+                return
+            if tgt["kind"] == "day":
+                reorder_item(self.data, src["key"], it, tgt["key"], index)
+            else:
+                move_list_item(src["key"], it, tgt["key"], index)
+            self._commit("순서 바꾸기")
+            return
+        if tgt["kind"] == "day":
+            reorder_item(self.data, src["key"], it, tgt["key"], index)
+            to = from_iso(tgt["key"])
+            self._commit("옮기기")
+            self._undoable(f"{to.month}/{to.day}({WEEKDAYS_KR[to.weekday()]})로 옮김")
+        else:
+            move_list_item(src["key"], it, tgt["key"], index)
+            self._commit("옮기기")
+            self._undoable(f"'{tgt['key']['name']}'(으)로 옮김")
 
     # ---------- 드래그 / 스크롤 / 저장 ----------
     def _drag_start(self, e):
@@ -1803,7 +2318,12 @@ class ScheduleWidget:
             side="left", fill="x", padx=(S(13), 0), pady=S(7))
         self._banner = b
 
-    def _persist(self):
+    def _persist(self, label="변경"):
+        """저장. label: 되돌리기 목록에 남길 이름 (None 이면 기록 안 함)"""
+        try:
+            self.history.record(self.data, label)
+        except Exception as e:
+            log_error("되돌리기 기록 실패", e)
         try:
             save_data(self.data)
         except Exception as e:
@@ -2232,13 +2752,32 @@ class ItemDialog:
 
         self.due = bool(item.get("due")) if item else False
         self.due_btn, self._due_style = _toggle_chip(app, inner, "D-day 표시 (이 날짜가 마감)", self.due)
-        self.due_btn.pack(anchor="w", pady=(0, S(14)))
+        self.due_btn.pack(anchor="w", pady=(0, S(12)))
         self.due_btn.bind("<Button-1>", lambda e: self._toggle_due())
+
+        # 매주 반복: 요일 선택
+        rule = find_rule(app.data, item.get("rid")) if item else None
+        self.weekdays = set(rule["weekdays"]) if rule else set()
+        tk.Label(inner, text="매주 반복", font=app.f_act, bg=C["bg"], fg=C["sub"]).pack(anchor="w")
+        wd = tk.Frame(inner, bg=C["bg"])
+        wd.pack(fill="x", pady=(S(6), S(4)))
+        self.wd_btns = []
+        for i, name in enumerate(WEEKDAYS_KR):
+            b = tk.Label(wd, text=name, font=app.f_act, padx=S(7), pady=S(3), cursor="hand2")
+            b.pack(side="left", padx=(0, S(4)))
+            b.bind("<Button-1>", lambda e, i=i: self._toggle_wd(i))
+            self.wd_btns.append(b)
+        self._style_wd()
+        hint = ("이 날 이후의 반복 일정이 모두 바뀝니다\n요일을 모두 끄면 반복이 끝납니다"
+                if rule else "요일을 고르면 매주 그 요일에 자동으로 들어갑니다")
+        tk.Label(inner, text=hint, font=app.f_status, bg=C["bg"], fg=C["muted"],
+                 wraplength=S(290), justify="left").pack(anchor="w", pady=(0, S(14)))
 
         btns = tk.Frame(inner, bg=C["bg"])
         btns.pack(fill="x")
         if item:
-            _dbtn(app, btns, "삭제", self._delete, C["danger_bg"], C["danger_fg"]).pack(side="left")
+            _dbtn(app, btns, "이번만 삭제" if item.get("rid") else "삭제", self._delete,
+                  C["danger_bg"], C["danger_fg"]).pack(side="left")
         _dbtn(app, btns, "취소", lambda: _close_modal(top), C["chip_bg"], C["text"]).pack(
             side="right", padx=(S(6), 0))
         _dbtn(app, btns, "저장", self._save, C["accent"], "#ffffff").pack(side="right")
@@ -2251,6 +2790,15 @@ class ItemDialog:
     def _toggle_due(self):
         self.due = not self.due
         self._due_style(self.due)
+
+    def _toggle_wd(self, i):
+        self.weekdays ^= {i}
+        self._style_wd()
+
+    def _style_wd(self):
+        for i, b in enumerate(self.wd_btns):
+            on = i in self.weekdays
+            b.configure(bg=C["accent"] if on else C["chip_bg"], fg="#ffffff" if on else C["sub"])
 
     def _pick(self, name):
         self.cat = name
@@ -2266,7 +2814,7 @@ class ItemDialog:
             self.entry.configure(highlightbackground=C["danger_fg"])
             return
         _close_modal(self.top)
-        self.app.save_item(self.day, self.item, text, self.cat, self.due)
+        self.app.save_item(self.day, self.item, text, self.cat, self.due, self.weekdays)
 
     def _delete(self):
         _close_modal(self.top)

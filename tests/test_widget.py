@@ -248,5 +248,162 @@ class OperationsTest(unittest.TestCase):
         self.assertEqual(sw.dday_info(TODAY - dt.timedelta(days=2))[0], "D+2")
 
 
+class ReorderTest(unittest.TestCase):
+    def test_reorder_within_day_and_move_to_other_day(self):
+        data = fresh()
+        a, b, c = ({"id": x, "text": x} for x in "abc")
+        data["items"]["2026-01-05"] = [a, b, c]
+        sw.reorder_item(data, "2026-01-05", a, "2026-01-05", 3)        # 맨 아래로
+        self.assertEqual([i["id"] for i in data["items"]["2026-01-05"]], ["b", "c", "a"])
+        sw.reorder_item(data, "2026-01-05", a, "2026-01-05", 0)        # 맨 위로
+        self.assertEqual([i["id"] for i in data["items"]["2026-01-05"]], ["a", "b", "c"])
+        sw.reorder_item(data, "2026-01-05", b, "2026-01-06", 0)
+        self.assertEqual([i["id"] for i in data["items"]["2026-01-06"]], ["b"])
+        self.assertEqual([i["id"] for i in data["items"]["2026-01-05"]], ["a", "c"])
+
+    def test_move_list_item(self):
+        L1 = {"name": "1", "items": [{"id": "a"}, {"id": "b"}]}
+        L2 = {"name": "2", "items": [{"id": "c"}]}
+        sw.move_list_item(L1, L1["items"][0], L1, 2)
+        self.assertEqual([i["id"] for i in L1["items"]], ["b", "a"])
+        sw.move_list_item(L1, L1["items"][1], L2, 0)
+        self.assertEqual([i["id"] for i in L2["items"]], ["a", "c"])
+        self.assertEqual([i["id"] for i in L1["items"]], ["b"])
+
+
+class RecurringTest(unittest.TestCase):
+    def setUp(self):
+        self.data = fresh()
+        self.rule = sw.add_recurring(self.data, "헬스", "운동", [0, 2, 4], WS)
+        self.end = WS + dt.timedelta(days=6)
+
+    def week_texts(self, ws=WS):
+        return {i: [it["text"] for it in self.data["items"].get(sw.iso(ws + dt.timedelta(days=i)), [])]
+                for i in range(7)}
+
+    def test_materialize_once_per_day(self):
+        self.assertEqual(sw.materialize_recurring(self.data, WS, self.end), 3)
+        self.assertEqual(sw.materialize_recurring(self.data, WS, self.end), 0)
+        w = self.week_texts()
+        self.assertEqual([i for i in range(7) if w[i]], [0, 2, 4])
+
+    def test_not_before_start(self):
+        self.rule["start"] = sw.iso(WS + dt.timedelta(days=3))
+        sw.materialize_recurring(self.data, WS, self.end)
+        self.assertEqual([i for i, t in self.week_texts().items() if t], [4])
+
+    def test_deleted_or_moved_occurrence_not_recreated(self):
+        sw.materialize_recurring(self.data, WS, self.end)
+        mon, wed = sw.iso(WS), sw.iso(WS + dt.timedelta(days=2))
+        it = self.data["items"][mon][0]
+        sw.skip_occurrence(self.data, it)
+        self.data["items"].pop(mon)
+        moved = self.data["items"][wed][0]
+        sw.reorder_item(self.data, wed, moved, sw.iso(WS + dt.timedelta(days=3)), 0)
+        self.assertEqual(sw.materialize_recurring(self.data, WS, self.end), 0)
+
+    def test_end_recurring_drops_future_unfinished(self):
+        nxt = WS + dt.timedelta(days=7)
+        sw.materialize_recurring(self.data, WS, nxt + dt.timedelta(days=6))
+        self.data["items"][sw.iso(nxt)][0]["done"] = True            # 완료한 건 남김
+        sw.end_recurring(self.data, self.rule["id"], WS + dt.timedelta(days=2))
+        self.assertEqual(sw.materialize_recurring(self.data, WS, nxt + dt.timedelta(days=6)), 0)
+        days = sorted(k for k, lst in self.data["items"].items() for it in lst)
+        self.assertEqual(days, [sw.iso(WS), sw.iso(WS + dt.timedelta(days=2)), sw.iso(nxt)])
+
+    def test_update_changes_future_text_and_weekdays(self):
+        sw.materialize_recurring(self.data, WS, self.end)
+        self.data["items"][sw.iso(WS)][0]["done"] = True
+        sw.update_recurring(self.data, self.rule["id"], WS, "헬스 1시간", "운동", [0, 4])
+        sw.materialize_recurring(self.data, WS, self.end)
+        w = self.week_texts()
+        self.assertEqual(w[0], ["헬스"])               # 이미 완료한 건 그대로
+        self.assertEqual(w[2], [])                     # 뺀 요일은 사라짐
+        self.assertEqual(w[4], ["헬스 1시간"])
+
+    def test_not_carried_over(self):
+        y = TODAY - dt.timedelta(days=1)
+        self.rule["start"] = sw.iso(y)
+        self.rule["weekdays"] = [y.weekday()]
+        sw.materialize_recurring(self.data, y, y)
+        self.assertEqual(sw.carry_over_candidates(self.data, TODAY), [])
+
+    def test_export_import_round_trip_keeps_link(self):
+        sw.materialize_recurring(self.data, WS, self.end)
+        note = sw.export_note(self.data, WS)
+        self.assertIn("헬스 (매주)", note)
+        again = imported(note, data=self.data)
+        sw.materialize_recurring(again, WS, self.end)
+        self.assertEqual(len(again["recurring"]), 1)
+        w = self.week_texts()
+        self.assertEqual([i for i in range(7) if w[i]], [0, 2, 4])
+        self.assertTrue(all(len(t) <= 1 for t in w.values()))       # 중복 없음
+        self.assertEqual(note, sw.export_note(again, WS))
+
+    def test_import_without_repeat_lines_keeps_recurring(self):
+        sw.materialize_recurring(self.data, WS, self.end)
+        imported("====== [ 학교 ] ======\n<화요일>\n⦁    과제\n", data=self.data)
+        sw.materialize_recurring(self.data, WS, self.end)
+        w = self.week_texts()
+        self.assertEqual(w[0], ["헬스"])
+        self.assertEqual(w[1], ["과제"])
+
+    def test_repeat_mark_in_note_creates_rule(self):
+        data = imported("====== [ 운동 ] ======\n<월요일>\n⦁    요가 (매주)\n<목요일>\n⦁    요가 (매주)\n")
+        self.assertEqual(len(data["recurring"]), 1)
+        self.assertEqual(data["recurring"][0]["weekdays"], [0, 3])
+        nxt = WS + dt.timedelta(days=7)
+        sw.materialize_recurring(data, nxt, nxt + dt.timedelta(days=6))
+        self.assertEqual([it["text"] for it in data["items"][sw.iso(nxt + dt.timedelta(days=3))]], ["요가"])
+
+
+class HistoryTest(unittest.TestCase):
+    def test_undo_redo(self):
+        data = fresh()
+        h = sw.History(data)
+        data["items"]["2026-01-05"] = [{"id": "a", "text": "첫 일정"}]
+        self.assertTrue(h.record(data, "추가"))
+        data["items"]["2026-01-05"][0]["done"] = True
+        h.record(data, "완료 체크")
+        label, data = h.undo(data)
+        self.assertEqual(label, "완료 체크")
+        self.assertFalse(data["items"]["2026-01-05"][0].get("done"))
+        label, data = h.undo(data)
+        self.assertEqual(data["items"], {})
+        self.assertIsNone(h.undo(data))
+        label, data = h.redo(data)
+        self.assertEqual(label, "추가")
+        self.assertEqual(data["items"]["2026-01-05"][0]["text"], "첫 일정")
+
+    def test_window_changes_and_auto_changes_not_recorded(self):
+        data = fresh()
+        h = sw.History(data)
+        data["window"]["px"] = 10
+        self.assertFalse(h.record(data, "창 이동"))
+        data["items"]["x"] = []
+        self.assertFalse(h.record(data, None))           # 자동 생성은 기록 안 함
+        self.assertEqual(h.undo_stack, [])
+
+    def test_undo_keeps_window_and_new_change_clears_redo(self):
+        data = fresh()
+        h = sw.History(data)
+        data["lists"].append({"name": "L", "items": []})
+        h.record(data, "새 목록")
+        data["window"]["px"] = 99
+        _, data = h.undo(data)
+        self.assertEqual(data["window"]["px"], 99)
+        data["lists"].append({"name": "M", "items": []})
+        h.record(data, "새 목록")
+        self.assertIsNone(h.redo(data))
+
+    def test_limit(self):
+        data = fresh()
+        h = sw.History(data, limit=5)
+        for i in range(12):
+            data["items"][str(i)] = []
+            h.record(data, "추가")
+        self.assertEqual(len(h.undo_stack), 5)
+
+
 if __name__ == "__main__":
     unittest.main()
